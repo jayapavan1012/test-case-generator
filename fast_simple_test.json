@@ -1,0 +1,4 @@
+{
+  "javaCode": "public class SimpleClass { public String getName() { return \"test\"; } }",
+  "className": "SimpleClass"
+}
