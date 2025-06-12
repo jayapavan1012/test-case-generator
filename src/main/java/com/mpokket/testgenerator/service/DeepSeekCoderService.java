@@ -440,6 +440,9 @@ public class DeepSeekCoderService {
 
     public Map<String, String> generateTestAndSave(String sourceFilePath) throws IOException {
         logger.info("Reading java file from path: {}", sourceFilePath);
+        if (sourceFilePath == null || sourceFilePath.trim().isEmpty()) {
+            throw new IOException("File not found at: " + sourceFilePath);
+        }
         Path sourcePath = Paths.get(sourceFilePath);
         if (!Files.exists(sourcePath)) {
             throw new IOException("File not found at: " + sourceFilePath);

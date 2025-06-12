@@ -17,28 +17,32 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
-    
+
     // JSON Processing
     implementation 'com.fasterxml.jackson.core:jackson-databind'
     implementation 'com.fasterxml.jackson.core:jackson-core'
     implementation 'com.fasterxml.jackson.core:jackson-annotations'
-    
+
     // HTTP Client
     implementation 'org.springframework.boot:spring-boot-starter-webflux'
-    
+
     // Development Tools
     developmentOnly 'org.springframework.boot:spring-boot-devtools'
-    
+
     // Testing
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testImplementation 'org.mockito:mockito-core'
-    
+
     // Logging
     implementation 'ch.qos.logback:logback-classic'
-    
+
     // Configuration Processor
     annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+}
+
+tasks.withType(GenerateModuleMetadata) {
+    enabled = false
 }
 
 tasks.named('test') {
@@ -49,7 +53,7 @@ tasks.named('test') {
 task deployDeepSeekCoder {
     description = 'Builds and prepares application for Deepseek-Coder 6.7B deployment'
     group = 'deployment'
-    
+
     doLast {
         println '🚀 Building Deepseek-Coder Test Generator...'
         println '📦 Model: Deepseek-Coder 6.7B-Instruct (Q4_K_M)'
@@ -57,7 +61,7 @@ task deployDeepSeekCoder {
         println '⚡ Memory: Optimized for 32GB RAM'
         println '✅ Build complete! Ready for deployment.'
     }
-    
+
     dependsOn build
 }
 
@@ -66,10 +70,10 @@ springBoot {
     buildInfo {
         properties {
             additional = [
-                'model': 'Deepseek-Coder 6.7B-Instruct',
-                'quantization': 'Q4_K_M',
-                'server': 'Distm1 (10.5.17.187)',
-                'optimization': '32GB RAM EC2'
+                    'model': 'Deepseek-Coder 6.7B-Instruct',
+                    'quantization': 'Q4_K_M',
+                    'server': 'Distm1 (10.5.17.187)',
+                    'optimization': '32GB RAM EC2'
             ]
         }
     }
