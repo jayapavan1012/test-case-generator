@@ -154,8 +154,8 @@ Generate complete, runnable JUnit 5 test code: [/INST]
                 echo=False,
                 # Performance optimizations
                 top_k=50,
-                typical_p=1.0,
-                mirostat=0,  # Disable mirostat for faster generation
+                typical_p=1.0
+                # mirostat=0,  # Disable mirostat for faster generation
             )
 
             generation_time = time.time() - start_time

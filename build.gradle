@@ -1,40 +1,76 @@
 plugins {
+    id 'java'
     id 'org.springframework.boot' version '3.2.3'
     id 'io.spring.dependency-management' version '1.1.4'
-    id 'java'
 }
 
 group = 'com.mpokket'
-version = '1.0-SNAPSHOT'
-sourceCompatibility = '17'
-targetCompatibility = '17'
+version = '1.0.0-DEEPSEEK'
+java.sourceCompatibility = JavaVersion.VERSION_17
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    // Spring Boot starters
-    implementation 'org.springframework.boot:spring-boot-starter-web:3.2.3'
-    implementation 'org.springframework.boot:spring-boot-starter-cache:3.2.3'
+    // Spring Boot Starters
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
     
-    // Core LLM Integration Dependencies
-    implementation 'com.github.javaparser:javaparser-core:3.25.5'
-    implementation 'org.json:json:20231013'
-    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
-    implementation 'com.fasterxml.jackson.core:jackson-databind:2.16.1'
+    // JSON Processing
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+    implementation 'com.fasterxml.jackson.core:jackson-core'
+    implementation 'com.fasterxml.jackson.core:jackson-annotations'
     
-    // Jakarta Annotations for @PostConstruct and @PreDestroy
-    implementation 'jakarta.annotation:jakarta.annotation-api:3.0.0'
+    // HTTP Client
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
+    
+    // Development Tools
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
     
     // Testing
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.mockito:mockito-core'
     
-    // Lombok for cleaner code
-    compileOnly 'org.projectlombok:lombok:1.18.30'
-    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+    // Logging
+    implementation 'ch.qos.logback:logback-classic'
+    
+    // Configuration Processor
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
 }
 
-test {
+tasks.named('test') {
     useJUnitPlatform()
+}
+
+// Custom task for Deepseek-Coder deployment
+task deployDeepSeekCoder {
+    description = 'Builds and prepares application for Deepseek-Coder 6.7B deployment'
+    group = 'deployment'
+    
+    doLast {
+        println '🚀 Building Deepseek-Coder Test Generator...'
+        println '📦 Model: Deepseek-Coder 6.7B-Instruct (Q4_K_M)'
+        println '🖥️  Target: EC2 Distm1 (10.5.17.187)'
+        println '⚡ Memory: Optimized for 32GB RAM'
+        println '✅ Build complete! Ready for deployment.'
+    }
+    
+    dependsOn build
+}
+
+// Configuration for Spring Boot
+springBoot {
+    buildInfo {
+        properties {
+            additional = [
+                'model': 'Deepseek-Coder 6.7B-Instruct',
+                'quantization': 'Q4_K_M',
+                'server': 'Distm1 (10.5.17.187)',
+                'optimization': '32GB RAM EC2'
+            ]
+        }
+    }
 } 

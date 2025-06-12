@@ -15,7 +15,6 @@ import signal
 import sys
 import requests
 from flask import Flask, request, jsonify
-import re
 
 # Import with graceful fallback
 try:
@@ -57,42 +56,17 @@ class DeepSeekV2Generator:
         self.top_p = 0.95          # High for stability
         self.repeat_penalty = 1.05  # Minimal to avoid issues
         
-        # This is the new, single-shot prompt that provides maximum context.
-        self.single_shot_prompt_template = """You are an expert Java test engineer. Generate a complete JUnit 5 test class for the provided Java class.
+        self.prompt_template = """### Instruction:
+You are an expert Java test engineer. Your task is to generate a complete, high-quality JUnit 5 test class for the provided Java source code.
+Your response must be only the raw Java code for the test class, enclosed in a single '```java' block.
+Do not add any comments, explanations, or introductory text outside the code block.
 
-### CRITICAL REQUIREMENTS:
-1. Test class name: {class_name}Test
-2. Use JUnit 5 and Mockito frameworks
-3. Include ALL necessary imports
-4. Use @ExtendWith(MockitoExtension.class) annotation
-5. Mock dependencies with @Mock annotations
-6. Use @InjectMocks for the class under test
-7. Create @Test methods for EVERY public method in the original class
-8. Include @BeforeEach setup method
-9. Use proper assertions and Mockito verification
+### Input Java Class:
+{java_code}
 
-### Dependencies to Mock:
-{dependencies_declarations}
-
-### Original Java Class:
+### Response (JUnit 5 Test Class):
 ```java
-{original_java_code}
-```
-
-### Your Task:
-Generate a COMPLETE test class that includes:
-- All necessary imports (JUnit 5, Mockito, static imports)
-- Proper class annotations (@ExtendWith(MockitoExtension.class))
-- All dependency mocks (@Mock annotations)
-- The class under test (@InjectMocks)
-- @BeforeEach setup method
-- @Test method for EVERY public method found in the original class
-- Proper test scenarios (success and failure cases where applicable)
-- No placeholder comments like "TODO" or "Add more tests"
-
-Generate ONLY the complete Java test class code without any explanations:
-
-```java"""
+"""
 
     def check_deepseek_v2_status(self):
         """Check if Ollama Deepseek-Coder-V2:16b is available"""
@@ -146,6 +120,28 @@ Generate ONLY the complete Java test class code without any explanations:
             logger.info("--- Full Prompt Sent to Model ---")
             logger.info(prompt)
             logger.info("-----------------------------------")
+
+            try:
+                import json
+                curl_url = f"{self.ollama_base_url}/api/generate"
+                # Pretty-print the JSON for the here document, making it readable and safe
+                json_payload_str = json.dumps(payload, indent=2)
+                # Use a heredoc for robustness. The user can copy-paste the entire multi-line command.
+                # The 'EOF' is quoted to prevent shell expansion within the JSON.
+                curl_command = f"""curl -X POST '{curl_url}' -H "Content-Type: application/json" --data @- <<'EOF'
+{json_payload_str}
+EOF"""
+                
+                logger.info("")
+                logger.info("")
+                logger.info("--- Equivalent cURL Command for Debugging ---")
+                logger.info("# (Run this in your terminal. It uses a 'here document' for safety.)")
+                logger.info(curl_command)
+                logger.info("---------------------------------------------")
+                logger.info("")
+                logger.info("")
+            except Exception as e:
+                logger.warning(f"⚠️  Could not generate cURL command for logging: {e}")
 
             logger.info("--- Sending POST request to Ollama server ---")
             
@@ -227,364 +223,75 @@ Generate ONLY the complete Java test class code without any explanations:
             self.deepseek_6b_loaded = False
             return False
 
-    def _extract_methods_with_details(self, java_code):
-        """Extracts public methods with their full code body for individual testing."""
-        logger.info("--- Starting Detailed Method Extraction ---")
-        methods = []
-        try:
-            # More comprehensive regex to find ALL public methods
-            # This pattern captures methods with various return types, annotations, and modifiers
-            method_pattern = re.compile(
-                r'(@[\w\s\(\)\"=,\.]*\s+)?'  # Optional annotations
-                r'public\s+'                   # public modifier
-                r'(?:static\s+)?'              # optional static
-                r'(?:final\s+)?'               # optional final
-                r'(?:synchronized\s+)?'        # optional synchronized
-                r'[\w\<\>\[\]\.,\s\?]+\s+'     # return type (including generics)
-                r'(\w+)\s*'                    # method name (captured)
-                r'\([^)]*\)\s*'                # parameters
-                r'(?:throws\s+[\w\.,\s]+\s*)?'  # optional throws clause
-                r'\{'                          # opening brace
-            )
-            
-            class_body_match = re.search(r'class\s+\w+[\s\S]*?\{([\s\S]*)\}', java_code)
-            if not class_body_match:
-                logger.warning("Could not find class body for method extraction.")
-                return []
-            
-            class_body = class_body_match.group(1)
-            
-            # Find all method starts
-            method_matches = list(method_pattern.finditer(class_body))
-            logger.info(f"Found {len(method_matches)} potential public methods")
-            
-            for i, match in enumerate(method_matches):
-                method_name = match.group(2)  # method name is in group 2
-                method_start = match.start()
-                
-                # Find the complete method by matching braces
-                open_braces = 0
-                method_full_code = ""
-                start_pos = match.start()
-                
-                for j, char in enumerate(class_body[start_pos:]):
-                    method_full_code += char
-                    if char == '{':
-                        open_braces += 1
-                    elif char == '}':
-                        open_braces -= 1
-                        if open_braces == 0:
-                            break
-                
-                # Only add if we found a complete method
-                if open_braces == 0 and method_name and method_name not in ['class', 'interface']:
-                    methods.append({"name": method_name, "code": method_full_code.strip()})
-                    logger.info(f"  -> Extracted method for testing: {method_name}")
-
-        except Exception as e:
-            logger.error(f"❌ Exception during detailed method extraction: {e}")
-        
-        logger.info(f"✅ Extracted {len(methods)} methods.")
-        return methods
-
-    def _get_class_context(self, java_code, methods_with_details):
-        """Extracts class context (imports, fields) by removing method bodies."""
-        logger.info("--- Extracting Class Context for Model ---")
-        context_code = java_code
-        for method in methods_with_details:
-            context_code = context_code.replace(method['code'], f"    // Method <{method['name']}> is being tested separately.")
-        logger.info("✅ Class context extracted successfully.")
-        return context_code
-
     def generate_junit_tests(self, java_code, class_name=None, model_type="auto"):
-        """
-        Generates JUnit tests using a chunked approach: process 100 lines at a time,
-        generate tests for methods in each chunk, then merge all tests.
-        """
-        logger.info("--- Starting Chunked Test Generation Pipeline ---")
+        """Generate JUnit tests with DEEPSEEK-V2 SUPPORT"""
+        logger.info("--- Starting Test Generation Pipeline ---")
         logger.info(f"Model: {model_type}, Class: {class_name}, Code length: {len(java_code)}")
 
         # Auto-select best available model
         if model_type == "auto":
-            model_type = "deepseek-v2" if self.deepseek_v2_available else "demo"
+            if self.deepseek_v2_available:
+                model_type = "deepseek-v2"
+            elif self.deepseek_6b_loaded:
+                model_type = "deepseek-6b"
+            else:
+                model_type = "demo"
             logger.info(f"🤖 Auto-selected model: {model_type}")
-
-        if model_type == "demo":
-            logger.info("Falling back to demo mode as requested/required.")
-            return self._generate_demo_tests(java_code, class_name), "Demo Mode"
 
         cache_key = hash(java_code + str(class_name) + model_type)
         if cache_key in self.generation_cache:
             logger.info(f"📦 Returning cached result for key {cache_key}")
             return self.generation_cache[cache_key]
         
+        logger.info("Cache miss. Proceeding with new generation.")
         if not class_name:
             class_name = self._extract_class_name(java_code)
         
+        methods = self._extract_methods(java_code)
+        method_list = "\n".join([f"- {m}" for m in methods]) if methods else "No public methods found to test."
+        
+        # New, robust prompt format for instruction-tuned models
+        prompt = self.prompt_template.format(
+            java_code=java_code
+        )
+        
         try:
-            # Step 1: Split code into 100-line chunks
-            chunks = self._split_code_into_chunks(java_code, lines_per_chunk=100)
-            logger.info(f"📝 Split code into {len(chunks)} chunks of ~100 lines each")
+            start_time = time.time()
+            logger.info(f"🔄 Generating for {class_name} using {model_type.upper()} (prompt: {len(prompt)} chars)")
             
-            # Step 2: Extract dependencies (once for the whole class)
-            dependencies = self._extract_dependencies(java_code)
-            dependencies_declarations = self._format_dependencies_for_prompt(dependencies)
-            
-            # Step 3: Generate test methods for each chunk
-            all_test_methods = []
-            for i, chunk in enumerate(chunks):
-                logger.info(f"🔍 Processing chunk {i+1}/{len(chunks)}")
-                methods_in_chunk = self._extract_methods_with_details(chunk['code'])
-                
-                if methods_in_chunk:
-                    logger.info(f"  -> Found {len(methods_in_chunk)} methods in chunk {i+1}: {[m['name'] for m in methods_in_chunk]}")
-                    chunk_tests = self._generate_tests_for_chunk(chunk, methods_in_chunk, class_name, dependencies_declarations)
-                    if chunk_tests:
-                        all_test_methods.extend(chunk_tests)
-                else:
-                    logger.info(f"  -> No methods found in chunk {i+1}")
-            
-            # Step 4: Merge all test methods into final test class
-            if all_test_methods:
-                logger.info(f"🔧 Merging {len(all_test_methods)} test methods into final test class")
-                final_test_class = self._merge_test_methods_into_class(all_test_methods, class_name, dependencies)
-                
-                result_tuple = (final_test_class, f"Deepseek-Coder-V2:16b (Chunked: {len(chunks)} chunks)")
-                self.generation_cache[cache_key] = result_tuple
-                return result_tuple
+            if model_type == "deepseek-v2" and self.deepseek_v2_available:
+                output = self.generate_with_deepseek_v2(prompt, self.max_tokens)
+                model_name = "Deepseek-Coder-V2:16b"
+            elif model_type == "deepseek-6b" and self.deepseek_6b_loaded and self.deepseek_6b_model:
+                output = self.deepseek_6b_model(prompt, max_tokens=self.max_tokens, temperature=self.temperature, top_p=self.top_p, repeat_penalty=self.repeat_penalty, stop=["```", "}\n}"], echo=False)
+                model_name = "Deepseek-Coder 6.7B"
             else:
-                logger.warning("No test methods generated from any chunk, falling back to demo")
+                logger.warning(f"⚠️  Model '{model_type}' not available, using demo tests.")
                 return self._generate_demo_tests(java_code, class_name), "Demo Mode"
-                
+            
+            generation_time = time.time() - start_time
+            
+            if not output or 'choices' not in output or not output['choices'] or not output['choices'][0]['text'].strip():
+                logger.warning("⚠️  Model returned an empty response. Falling back to demo tests.")
+                return self._generate_demo_tests(java_code, class_name), "Demo Mode"
+            
+            logger.info(f"✅ Generation completed in {generation_time:.2f}s using {model_name}")
+            
+            generated_text = output['choices'][0]['text']
+            cleaned_code = self._clean_generated_code(generated_text, class_name)
+            
+            if not self._validate_generated_code(cleaned_code, class_name):
+                logger.warning("⚠️  Generated code failed validation. Falling back to demo tests.")
+                return self._generate_demo_tests(java_code, class_name), "Demo Mode"
+            
+            logger.info("✅ Code validation successful.")
+            result_tuple = (cleaned_code, model_name)
+            self.generation_cache[cache_key] = result_tuple
+            return result_tuple
+            
         except Exception as e:
-            logger.error(f"❌ Chunked generation failed: {e}. Falling back to demo mode.")
+            logger.error(f"❌ Exception in generation pipeline: {type(e).__name__}: {str(e)}")
             return self._generate_demo_tests(java_code, class_name), "Demo Mode"
-
-    def _split_code_into_chunks(self, java_code, lines_per_chunk=100):
-        """Split Java code into chunks of specified line count with context preservation."""
-        lines = java_code.split('\n')
-        chunks = []
-        
-        # Get the class header (package, imports, class declaration)
-        class_header_end = 0
-        for i, line in enumerate(lines):
-            if 'class ' in line and any(mod in line for mod in ['public', 'private', 'protected']):
-                class_header_end = i + 1
-                break
-        
-        class_header = '\n'.join(lines[:class_header_end])
-        class_body_lines = lines[class_header_end:]
-        
-        # Split the class body into chunks
-        for i in range(0, len(class_body_lines), lines_per_chunk):
-            chunk_lines = class_body_lines[i:i + lines_per_chunk]
-            chunk_code = class_header + '\n' + '\n'.join(chunk_lines) + '\n}'  # Add closing brace
-            
-            chunks.append({
-                'chunk_number': len(chunks) + 1,
-                'start_line': class_header_end + i + 1,
-                'end_line': class_header_end + i + len(chunk_lines),
-                'code': chunk_code,
-                'line_count': len(chunk_lines)
-            })
-        
-        return chunks
-
-    def _format_dependencies_for_prompt(self, dependencies):
-        """Format dependencies for the prompt."""
-        if dependencies:
-            deps_text = ""
-            for dep in dependencies:
-                deps_text += f"    - `{dep['type']} {dep['name']}`\n"
-            return deps_text
-        else:
-            return "    - None\n"
-
-    def _generate_tests_for_chunk(self, chunk, methods_in_chunk, class_name, dependencies_declarations):
-        """Generate test methods for a specific chunk."""
-        if not methods_in_chunk:
-            return []
-        
-        # Create method names list for the prompt
-        method_names = [m['name'] for m in methods_in_chunk]
-        method_names_list = ', '.join(method_names)
-        
-        # Create a focused prompt for this chunk
-        chunk_prompt = f"""You are an expert Java test engineer. Generate JUnit 5 test methods for the specific methods found in this code chunk.
-
-### CRITICAL REQUIREMENTS:
-1. Generate ONLY @Test methods (no class declaration, no imports)
-2. Test class name should be: {class_name}Test
-3. Use proper JUnit 5 and Mockito patterns
-4. Create tests for these specific methods: {method_names_list}
-5. Use mocked dependencies: 
-{dependencies_declarations}
-
-### Code Chunk (lines {chunk['start_line']}-{chunk['end_line']}):
-```java
-{chunk['code']}
-```
-
-### Methods to test in this chunk:
-{chr(10).join([f"- {m['name']}()" for m in methods_in_chunk])}
-
-### Your task:
-Generate ONLY the @Test method implementations for the above methods. Each test should:
-- Have a descriptive name like testMethodNameSuccess() or testMethodNameFailure()
-- Use proper assertions and Mockito when() and verify() calls
-- Include both positive and negative test cases where applicable
-
-Generate ONLY the test methods (no class wrapper):
-
-```java"""
-
-        try:
-            logger.info(f"🤖 Generating tests for chunk methods: {method_names}")
-            output = self.generate_with_deepseek_v2(chunk_prompt, max_tokens=1024)
-            
-            if output and output['choices'] and output['choices'][0]['text'].strip():
-                response_text = output['choices'][0]['text'].strip()
-                test_methods = self._extract_test_methods_from_response(response_text)
-                logger.info(f"✅ Generated {len(test_methods)} test methods for chunk")
-                return test_methods
-            else:
-                logger.warning("Empty response from model for chunk")
-                return []
-                
-        except Exception as e:
-            logger.error(f"❌ Failed to generate tests for chunk: {e}")
-            return []
-
-    def _extract_test_methods_from_response(self, response_text):
-        """Extract individual @Test methods from the model response."""
-        try:
-            # Clean the response first
-            cleaned_response = self._clean_generated_code(response_text, "TempClass")
-            
-            # Extract individual @Test methods
-            test_method_pattern = re.compile(
-                r'(@Test[\s\S]*?)'  # Start with @Test annotation
-                r'((?:@\w+[\s\S]*?)*)'  # Optional additional annotations
-                r'((?:public|private|protected)\s+void\s+\w+\s*\([^)]*\)\s*\{)'  # Method signature
-                r'([\s\S]*?)'  # Method body
-                r'(\n\s*})'  # Closing brace
-            )
-            
-            methods = []
-            matches = test_method_pattern.finditer(cleaned_response)
-            
-            for match in matches:
-                full_method = match.group(0).strip()
-                if full_method and '@Test' in full_method:
-                    methods.append(full_method)
-            
-            # Fallback: simple line-by-line extraction
-            if not methods:
-                lines = cleaned_response.split('\n')
-                current_method = []
-                in_method = False
-                brace_count = 0
-                
-                for line in lines:
-                    if '@Test' in line:
-                        current_method = [line]
-                        in_method = True
-                        brace_count = 0
-                    elif in_method:
-                        current_method.append(line)
-                        brace_count += line.count('{') - line.count('}')
-                        
-                        if brace_count == 0 and '}' in line:
-                            methods.append('\n'.join(current_method))
-                            current_method = []
-                            in_method = False
-            
-            logger.info(f"📋 Extracted {len(methods)} test methods from response")
-            return methods
-            
-        except Exception as e:
-            logger.error(f"❌ Error extracting test methods: {e}")
-            return []
-
-    def _merge_test_methods_into_class(self, all_test_methods, class_name, dependencies):
-        """Merge all test methods into a complete test class."""
-        logger.info(f"🔧 Merging {len(all_test_methods)} test methods into final {class_name}Test class")
-        
-        # Remove duplicates based on method name
-        unique_methods = []
-        seen_method_names = set()
-        
-        for method in all_test_methods:
-            # Extract method name for deduplication
-            method_name_match = re.search(r'void\s+(\w+)\s*\(', method)
-            if method_name_match:
-                method_name = method_name_match.group(1)
-                if method_name not in seen_method_names:
-                    unique_methods.append(method)
-                    seen_method_names.add(method_name)
-                else:
-                    logger.info(f"  -> Skipping duplicate method: {method_name}")
-        
-        logger.info(f"📝 After deduplication: {len(unique_methods)} unique test methods")
-        
-        # Build the complete test class
-        imports = """import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;
-import java.util.Map;
-import java.util.HashMap;"""
-
-        # Mock declarations
-        mock_declarations = ""
-        for dep in dependencies:
-            mock_declarations += f"    @Mock\n    private {dep['type']} {dep['name']};\n\n"
-
-        # Class structure
-        test_class = f"""{imports}
-
-@ExtendWith(MockitoExtension.class)
-public class {class_name}Test {{
-
-{mock_declarations}    @InjectMocks
-    private {class_name} {class_name.lower()};
-
-    @BeforeEach
-    public void setUp() {{
-        // Setup is handled by Mockito annotations
-    }}
-
-{chr(10).join(['    ' + method.replace(chr(10), chr(10) + '    ') for method in unique_methods])}
-}}"""
-
-        return test_class
-
-    def _extract_test_methods_from_class(self, java_code):
-        """Extracts all methods annotated with @Test from a Java class string."""
-        logger.info("--- Extracting @Test methods from generated class ---")
-        try:
-            # This regex captures the entire method block for any method annotated with @Test.
-            # It handles various annotations that might be between @Test and the method signature.
-            pattern = re.compile(r'(@Test[\s\S]*?(?:public|private|protected)\s+void\s+\w+\s*\([\s\S]*?\)\s*\{[\s\S]*?\})')
-            matches = pattern.findall(java_code)
-            
-            if not matches:
-                logger.warning("⚠️ No @Test methods found in the generated code block.")
-                return []
-
-            logger.info(f"✅ Found {len(matches)} @Test methods.")
-            # Return the list of matched method strings
-            return [match.strip() for match in matches]
-            
-        except Exception as e:
-            logger.error(f"❌ Exception during @Test method extraction: {e}")
-            return []
 
     def _validate_generated_code(self, code, class_name):
         """Validate the generated test code with detailed logging."""
@@ -618,8 +325,7 @@ public class {class_name}Test {{
         if not class_name:
             class_name = self._extract_class_name(java_code)
         
-        methods_details = self._extract_methods_with_details(java_code)
-        methods = [f"{m['name']}()" for m in methods_details]
+        methods = self._extract_methods(java_code)
         
         test_methods = []
         for method in methods[:3]:
@@ -684,10 +390,36 @@ public class {class_name}Test {{
         return "TestClass"
 
     def _extract_methods(self, java_code):
-        """DEPRECATED: This is a placeholder. Use _extract_methods_with_details instead."""
-        logger.warning("Using deprecated _extract_methods. Please update calling function.")
-        details = self._extract_methods_with_details(java_code)
-        return [f"{d['name']}()" for d in details]
+        """Extract method signatures from Java code using a robust regex that handles annotations."""
+        logger.info("--- Starting Method Extraction ---")
+        methods = []
+        try:
+            import re
+            # Regex to find public methods, ignoring annotations and handling multi-line params.
+            pattern = re.compile(
+                r'public\s+(?:static\s+)?'  # Modifier
+                r'[\w\<\>\[\]\.,\s]+?\s+'  # Non-greedy return type
+                r'(\w+)\s*'  # Method Name (the only capture group)
+                r'\([\s\S]*?\)\s*'  # Parameters (multi-line)
+                r'(?:throws\s+[\w\.,\s]+)?\s*{'
+            )
+            matches = pattern.findall(java_code)
+            logger.info(f"Found {len(matches)} potential public methods using regex.")
+            
+            for method_name in matches:
+                if method_name not in ['class', 'interface', 'enum']:
+                    logger.info(f"  -> Extracted method: {method_name}()")
+                    methods.append(f"{method_name}()")
+
+            if not methods:
+                 logger.warning("⚠️  Could not extract any public methods. The model will receive an empty method list.")
+            else:
+                logger.info(f"✅ Successfully extracted methods: {methods}")
+        except Exception as e:
+            logger.error(f"❌ Exception during method extraction: {str(e)}")
+        
+        logger.info("--- Finished Method Extraction ---")
+        return methods[:5]  # Max 5 methods
 
     def _clean_generated_code(self, generated_text, class_name):
         """Clean and format generated code by extracting the final Java code block."""
@@ -734,48 +466,6 @@ public class {class_name}Test {{
             "model_loaded": self.deepseek_6b_loaded,
             "cache_size": len(self.generation_cache)
         }
-
-    def _extract_dependencies(self, java_code):
-        """Extracts dependencies that need to be mocked including @Autowired fields and constructor parameters."""
-        logger.info("--- Extracting Dependencies ---")
-        dependencies = []
-        try:
-            # Pattern 1: @Autowired fields
-            autowired_pattern = re.compile(r'@Autowired\s+(?:private\s+)?(\w+(?:<[^>]+>)?)\s+(\w+);')
-            autowired_matches = autowired_pattern.findall(java_code)
-            for match in autowired_matches:
-                dep_type = match[0].strip()
-                dep_name = match[1].strip()
-                dependencies.append({'type': dep_type, 'name': dep_name})
-                logger.info(f"  -> Found @Autowired dependency: {dep_type} {dep_name}")
-
-            # Pattern 2: Private final fields (often injected via constructor)
-            final_field_pattern = re.compile(r'private\s+final\s+(\w+(?:<[^>]+>)?)\s+(\w+);')
-            final_matches = final_field_pattern.findall(java_code)
-            for match in final_matches:
-                dep_type = match[0].strip()
-                dep_name = match[1].strip()
-                # Avoid duplicates
-                if not any(d['name'] == dep_name for d in dependencies):
-                    dependencies.append({'type': dep_type, 'name': dep_name})
-                    logger.info(f"  -> Found private final dependency: {dep_type} {dep_name}")
-
-            # Pattern 3: Constructor parameters (for dependency injection)
-            constructor_pattern = re.compile(r'public\s+\w+\s*\([^)]*(\w+(?:<[^>]+>)?)\s+(\w+)[^)]*\)')
-            constructor_matches = constructor_pattern.findall(java_code)
-            for match in constructor_matches:
-                dep_type = match[0].strip()
-                dep_name = match[1].strip()
-                # Avoid duplicates and basic types
-                if (not any(d['name'] == dep_name for d in dependencies) and 
-                    dep_type not in ['String', 'int', 'boolean', 'long', 'double']):
-                    dependencies.append({'type': dep_type, 'name': dep_name})
-                    logger.info(f"  -> Found constructor dependency: {dep_type} {dep_name}")
-
-            logger.info(f"✅ Found {len(dependencies)} total dependencies: {[d['name'] for d in dependencies]}")
-        except Exception as e:
-            logger.error(f"❌ Exception during dependency extraction: {e}")
-        return dependencies
 
 # Global generator instance
 generator = DeepSeekV2Generator()

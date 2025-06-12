@@ -1,0 +1,207 @@
+🚀 DEEPSEEK-CODER 6.7B QUICK DEPLOYMENT COMMANDS
+EC2 Distm1 (10.5.17.187) - Copy & Paste Ready
+
+# ===============================================
+# 1. CONNECT TO DISTM1
+# ===============================================
+ssh adminuser@10.5.17.187
+# Password: 92<ae8JEzi/B
+
+# ===============================================
+# 2. SYSTEM SETUP
+# ===============================================
+sudo apt-get update && sudo apt-get upgrade -y
+sudo apt-get install -y python3 python3-pip wget curl htop jq
+pip3 install --user flask llama-cpp-python psutil huggingface-hub
+export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+# ===============================================
+# 3. DOWNLOAD DEEPSEEK-CODER MODEL (~4.2GB)
+# ===============================================
+mkdir -p /home/adminuser/models
+cd /home/adminuser/models
+
+# Option A: Direct download
+wget -O deepseek-coder-6.7b-instruct.Q4_K_M.gguf \
+  "https://huggingface.co/TheBloke/deepseek-coder-6.7B-instruct-GGUF/resolve/main/deepseek-coder-6.7b-instruct.Q4_K_M.gguf"
+
+# Option B: Using huggingface-hub (more reliable)
+python3 -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id='TheBloke/deepseek-coder-6.7B-instruct-GGUF',
+    filename='deepseek-coder-6.7b-instruct.Q4_K_M.gguf',
+    local_dir='/home/adminuser/models',
+    local_dir_use_symlinks=False
+)
+"
+
+# Verify download
+ls -lh /home/adminuser/models/
+
+# ===============================================
+# 4. CREATE DEEPSEEK-CODER SERVER
+# ===============================================
+nano /home/adminuser/deepseek_coder_server.py
+# COPY THE ENTIRE CONTENT FROM deepseek_coder_server.py
+
+chmod +x /home/adminuser/deepseek_coder_server.py
+mkdir -p /home/adminuser/logs
+
+# ===============================================
+# 5. START DEEPSEEK-CODER SERVER
+# ===============================================
+
+# CPU Mode (Recommended for 32GB EC2)
+nohup python3 /home/adminuser/deepseek_coder_server.py \
+  --port 8082 \
+  --host 0.0.0.0 \
+  --model-path /home/adminuser/models/deepseek-coder-6.7b-instruct.Q4_K_M.gguf \
+  > /home/adminuser/logs/deepseek-coder.log 2>&1 &
+
+# GPU Mode (If GPU available)
+nohup python3 /home/adminuser/deepseek_coder_server.py \
+  --port 8082 \
+  --host 0.0.0.0 \
+  --model-path /home/adminuser/models/deepseek-coder-6.7b-instruct.Q4_K_M.gguf \
+  --use-gpu \
+  > /home/adminuser/logs/deepseek-coder.log 2>&1 &
+
+# ===============================================
+# 6. TEST DEEPSEEK-CODER SERVER
+# ===============================================
+
+# Health check
+curl http://localhost:8082/health | jq
+
+# Test generation
+curl -X POST http://localhost:8082/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "public class Calculator { public int add(int a, int b) { return a + b; } }",
+    "className": "Calculator"
+  }' | jq
+
+# System status
+curl http://localhost:8082/system-status | jq
+
+# ===============================================
+# 7. TEST FROM EXTERNAL (Your Local Machine)
+# ===============================================
+curl http://10.5.17.187:8082/health | jq
+curl http://10.5.17.187:8082/system-status | jq
+
+# ===============================================
+# 8. SPRING BOOT SETUP (On Your Local Machine)
+# ===============================================
+./gradlew clean build
+./gradlew bootRun
+
+# Test Deepseek-Coder endpoints
+curl http://localhost:8081/api/deepseek/health | jq
+
+curl -X POST http://localhost:8081/api/deepseek/generate-tests \
+  -H "Content-Type: application/json" \
+  -d '{
+    "javaCode": "public class Calculator { public int add(int a, int b) { return a + b; } }",
+    "className": "Calculator"
+  }' | jq
+
+# ===============================================
+# 9. MONITORING COMMANDS
+# ===============================================
+
+# Watch logs in real-time
+tail -f /home/adminuser/logs/deepseek-coder.log
+
+# Check running processes
+ps aux | grep deepseek
+
+# Monitor system resources
+htop
+free -h
+curl http://10.5.17.187:8082/system-status | jq
+
+# ===============================================
+# 10. RESTART/STOP COMMANDS
+# ===============================================
+
+# Stop Deepseek-Coder
+pkill -f "python.*deepseek"
+
+# Restart Deepseek-Coder
+nohup python3 /home/adminuser/deepseek_coder_server.py \
+  --port 8082 \
+  --host 0.0.0.0 \
+  --model-path /home/adminuser/models/deepseek-coder-6.7b-instruct.Q4_K_M.gguf \
+  > /home/adminuser/logs/deepseek-coder.log 2>&1 &
+
+# Clear cache
+curl -X POST http://10.5.17.187:8082/clear-cache | jq
+
+# ===============================================
+# 11. TROUBLESHOOTING COMMANDS
+# ===============================================
+
+# Check if port is in use
+netstat -tulpn | grep 8082
+
+# Check model file
+ls -lh /home/adminuser/models/deepseek-coder-6.7b-instruct.Q4_K_M.gguf
+
+# Test without background
+python3 /home/adminuser/deepseek_coder_server.py --port 8082 --host 0.0.0.0
+
+# Check memory usage
+free -h
+ps aux --sort=-%mem | head -10
+
+# ===============================================
+# 12. PRODUCTION SYSTEMD SERVICE (Optional)
+# ===============================================
+sudo nano /etc/systemd/system/deepseek-coder.service
+
+# Service content:
+[Unit]
+Description=Deepseek-Coder 6.7B Test Generator
+After=network.target
+
+[Service]
+Type=simple
+User=adminuser
+WorkingDirectory=/home/adminuser
+ExecStart=/usr/bin/python3 /home/adminuser/deepseek_coder_server.py --port 8082 --host 0.0.0.0 --model-path /home/adminuser/models/deepseek-coder-6.7b-instruct.Q4_K_M.gguf
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+# Enable and start service
+sudo systemctl daemon-reload
+sudo systemctl enable deepseek-coder
+sudo systemctl start deepseek-coder
+sudo systemctl status deepseek-coder
+
+# ===============================================
+# SUCCESS INDICATORS
+# ===============================================
+
+# ✅ Health check returns: {"status": "healthy", "model": "Deepseek-Coder 6.7B-Instruct"}
+# ✅ Memory usage: ~4GB for model (vs 8-12GB for CodeLlama 13B)
+# ✅ Generation time: 5-45 seconds (vs 60-180 for larger models)
+# ✅ Spring Boot integration: All /api/deepseek/* endpoints working
+# ✅ Generated tests: Proper JUnit 5 format with comprehensive coverage
+
+# ===============================================
+# PERFORMANCE EXPECTATIONS
+# ===============================================
+
+# Model Loading: ~30-60 seconds
+# Memory Usage: ~4GB model + 2GB overhead = 6GB total
+# Generation Speed: 10-45 seconds typical
+# Concurrent Users: 2-3 simultaneous (32GB RAM)
+# Cache Hit Rate: ~60-80% for repeated requests
+
+🚀 DEEPSEEK-CODER 6.7B DEPLOYMENT COMPLETE! 
