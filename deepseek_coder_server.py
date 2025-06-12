@@ -248,6 +248,154 @@ class DeepSeekV2Generator:
             return "Component"
         return "Class"
 
+    def _create_chunk_generation_prompt(self, java_code, class_name, package_name, method_chunk):
+        """Creates a prompt to generate tests for a small chunk of methods."""
+        method_list = "\n".join([f"- `{m['return_type']} {m['name']}(...);`" for m in method_chunk])
+        
+        return f"""You are a Java test engineer. Your task is to write JUnit 5 test methods for a specific set of methods from a Java class.
+
+### Full Class Context (for reference only)
+```java
+{java_code}
+```
+
+### INSTRUCTIONS
+- Write complete, runnable JUnit 5 `@Test` methods for the following methods ONLY:
+{method_list}
+- For each method, provide at least one positive and one negative test case.
+- Use the Arrange-Act-Assert pattern.
+- Assume all necessary mocks (`@Mock`) and the class under test (`@InjectMocks private {class_name} {class_name[0].lower() + class_name[1:]};`) are already defined in the test class.
+- DO NOT write the class definition, package statement, or imports.
+- DO NOT write `@BeforeEach` or other setup methods.
+- ONLY output the test methods themselves, without any surrounding markdown.
+
+Generate the test methods now.
+"""
+
+    def _create_finalization_prompt(self, java_code, class_name, package_name, combined_snippets):
+        """Creates a prompt to combine and finalize the generated test snippets."""
+        dependencies = self._extract_dependencies(java_code)
+        dep_list = ", ".join([f"`{d['type']} {d['name']}`" for d in dependencies]) or "None"
+
+        return f"""You are a senior Java test automation engineer. Your task is to assemble a complete and valid JUnit 5 test class from a set of generated test method snippets.
+
+### Original Java Class to Test
+```java
+package {package_name};
+
+{java_code}
+```
+
+### Detected Dependencies to Mock
+{dep_list}
+
+### Generated Test Method Snippets
+Here are the generated test methods. They may be incomplete, contain errors, or lack context.
+```java
+{combined_snippets}
+```
+
+### FINAL INSTRUCTIONS
+1.  **Assemble a Single, Complete Class:** Create one full, runnable JUnit 5 test class named `{class_name}Test`.
+2.  **Package and Imports:** Start with the correct package (`package {package_name};`) and add ALL necessary imports (JUnit, Mockito, etc.).
+3.  **Class and Mock Setup:**
+    - Annotate the class with `@ExtendWith(MockitoExtension.class)`.
+    - Create `@Mock` fields for all dependencies.
+    - Create the `@InjectMocks` field for the class under test.
+    - Add a `@BeforeEach` `setUp()` method with `MockitoAnnotations.openMocks(this);`.
+4.  **Integrate and Clean:**
+    - Place all the provided test method snippets inside the class.
+    - **Fix all syntax errors and consolidate duplicate imports.**
+    - Ensure consistent formatting and that the code is complete.
+5.  **No Placeholders:** The final output MUST be a complete, runnable file. Do not include `// TODO` or comments about missing code.
+
+Generate the final, complete, and correct JUnit 5 test class now.
+"""
+
+    def _stitch_snippets_manually(self, java_code, class_name, package_name, combined_snippets):
+        """A fallback method to stitch snippets together if the AI finalization fails."""
+        logger.warning(f"AI finalization failed. Stitching snippets manually for {class_name}.")
+        dependencies = self._extract_dependencies(java_code)
+        
+        imports = {
+            "import org.junit.jupiter.api.Test;",
+            "import static org.junit.jupiter.api.Assertions.*;",
+            "import static org.mockito.Mockito.*;",
+            "import org.junit.jupiter.api.BeforeEach;",
+            "import org.junit.jupiter.api.extension.ExtendWith;",
+            "import org.mockito.InjectMocks;",
+            "import org.mockito.Mock;",
+            "import org.mockito.MockitoAnnotations;",
+            "import org.mockito.junit.jupiter.MockitoExtension;"
+        }
+        # A simple way to guess imports from dependencies
+        for dep in dependencies:
+            if '.' in dep['type'] and not dep['type'].startswith('java.lang'):
+                 imports.add(f"import {dep['type']};")
+
+
+        mock_fields = "\n    ".join([f"@Mock\n    private {d['type'].split('.')[-1]} {d['name']};" for d in dependencies])
+        
+        code = f"""package {package_name};
+
+{' '.join(sorted(list(imports)))}
+
+@ExtendWith(MockitoExtension.class)
+class {class_name}Test {{
+
+    {mock_fields}
+
+    @InjectMocks
+    private {class_name} {class_name[0].lower() + class_name[1:]};
+
+    @BeforeEach
+    void setUp() {{
+        MockitoAnnotations.openMocks(this);
+    }}
+
+    // --- Generated Test Methods ---
+    // AI finalization failed. The following snippets are combined manually.
+    // They may require manual correction.
+{combined_snippets}
+}}
+"""
+        return code
+
+    def _generate_tests_chunked(self, java_code, class_name, package_name, model_type, methods):
+        """Generates tests by breaking the class into method chunks and then combining the results."""
+        # Chunk methods into groups of 4 to manage prompt size
+        method_chunks = [methods[i:i + 4] for i in range(0, len(methods), 4)]
+        logger.info(f"Splitting {len(methods)} methods of {class_name} into {len(method_chunks)} chunks.")
+
+        generated_test_snippets = []
+        for i, chunk in enumerate(method_chunks):
+            logger.info(f"Generating tests for chunk {i+1}/{len(method_chunks)}...")
+            chunk_prompt = self._create_chunk_generation_prompt(java_code, class_name, package_name, chunk)
+            try:
+                response = self.generate_with_deepseek_v2(chunk_prompt, max_tokens=2048)
+                snippet = response['choices'][0]['text']
+                # Basic cleaning of the snippet
+                snippet = re.sub(r'```java\n?', '', snippet.strip())
+                snippet = re.sub(r'```', '', snippet)
+                generated_test_snippets.append(snippet)
+            except Exception as e:
+                logger.error(f"Failed to generate tests for chunk {i+1}: {e}")
+                method_names = ", ".join([m['name'] for m in chunk])
+                generated_test_snippets.append(f"\n    // AI failed to generate tests for methods: {method_names}\n")
+        
+        logger.info("Combining and finalizing all generated test snippets.")
+        combined_snippets = "\n\n".join(generated_test_snippets)
+        
+        finalization_prompt = self._create_finalization_prompt(java_code, class_name, package_name, combined_snippets)
+        
+        try:
+            final_response = self.generate_with_deepseek_v2(finalization_prompt, max_tokens=8192)
+            final_code = final_response['choices'][0]['text']
+            return self._clean_generated_code(final_code, class_name)
+        except Exception as e:
+            logger.error(f"Final test formatting failed for {class_name}: {e}")
+            return self._stitch_snippets_manually(java_code, class_name, package_name, combined_snippets)
+
     def generate_junit_tests(self, java_code, class_name=None, model_type="auto"):
         """
         Main method to generate JUnit tests for a given Java class.
@@ -260,774 +408,92 @@ class DeepSeekV2Generator:
 
         package_name = self._extract_package_name(java_code)
         
-        # Decide which generation strategy to use
-        # If the code is small, single-shot is faster.
-        # Let's define "small" as under 200 lines.
-        if len(java_code.split('\n')) < 200:
-             logger.info("Code is small, using single-shot generation.")
-             return self._generate_tests_single_shot(java_code, class_name, package_name, model_type)
-        else:
-             logger.info("Code is large, using chunked generation.")
-             return self._generate_tests_chunked(java_code, class_name, package_name, model_type)
+        line_count = len(java_code.split('\n'))
+        methods = self._extract_methods_with_details(java_code)
+        
+        # Heuristic: if the class is small (under 150 lines and < 5 methods), use single-shot.
+        # Otherwise, use the more robust chunking approach.
+        if line_count < 150 and len(methods) < 5:
+            logger.info(f"Class '{class_name}' is small ({line_count} lines, {len(methods)} methods). Using single-shot generation.")
+            return self._generate_tests_single_shot(java_code, class_name, package_name, model_type)
+        
+        logger.info(f"Class '{class_name}' is large ({line_count} lines, {len(methods)} methods). Using chunked generation.")
+        return self._generate_tests_chunked(java_code, class_name, package_name, model_type, methods)
 
     def _generate_tests_single_shot(self, java_code, class_name, package_name, model_type):
         """
         Generates a complete test class in a single request to the AI model.
-        Suitable for smaller classes.
+        This method constructs a highly detailed and strict prompt to ensure
+        the AI generates comprehensive and complete test coverage.
         """
         dependencies = self._extract_dependencies(java_code)
-        value_fields = self._extract_value_fields(java_code)
-        methods = self._extract_methods_with_details(java_code)
-        
-        dependencies_declarations = self._format_dependencies_for_prompt(dependencies)
-        
-        prompt = f"""You are a world-class Java test engineer. Generate a complete JUnit 5 test class for the following Java class.
+        methods_to_test = self._extract_methods(java_code)
+        method_list_str = "\n- ".join(methods_to_test) if methods_to_test else "No public methods found."
+
+        prompt = f"""You are a senior Java test automation engineer. Your mission is to write a production-ready, comprehensive, and complete JUnit 5 test class for the provided Java code.
 
 ### Java Class to Test
 ```java
+package {package_name};
+
 {java_code}
 ```
 
-### CRITICAL REQUIREMENTS
-1.  **Full Class:** Generate a complete, runnable JUnit 5 test class, including package, imports, class declaration, fields, and test methods.
-2.  **Structure:**
-    - Use `@ExtendWith(MockitoExtension.class)`.
-    - Use `@Mock` for all dependencies: {', '.join([d['name'] for d in dependencies])}.
-    - Use `@InjectMocks` for the class under test: `{class_name.lower()}`.
-    - If applicable, include a `@BeforeEach` `setUp()` method for common test arrangements.
-3.  **Test Naming:** Use the `test<MethodName>_<Scenario>` convention.
-4.  **Coverage:**
-    - For each public method in `{class_name}`, create at least one success and one failure/exception test case.
-    - Use `assertThrows` to verify expected exceptions.
-    - Mock dependencies to return values for success cases (`when(...).thenReturn(...)`) and to throw exceptions for failure cases (`when(...).thenThrow(...)`).
-5.  **Quality:**
-    - Follow the **Arrange-Act-Assert** pattern, with comments.
-    - Use meaningful assertions (`assertEquals`, `assertNotNull`, `assertTrue`, etc.).
-    - Verify mock interactions using `verify()`.
-    - DO NOT include `// TODO` or placeholder comments.
+### Class to be Tested: `{class_name}`
 
-### Example Test Method Structure:
-```java
-@Test
-public void testSomeMethod_Success() {{
-    // Arrange
-    when(dependency.someCall(anyString())).thenReturn("mocked response");
+### Public Methods to Test:
+You are required to generate tests for the following public methods:
+- {method_list_str}
 
-    // Act
-    String result = {class_name.lower()}.someMethod("input");
+### STRICT INSTRUCTIONS:
+1.  **FULL COVERAGE IS MANDATORY:** You MUST write test cases for EVERY single public method listed above. No exceptions.
+2.  **NO INCOMPLETE CODE:** You MUST NOT generate partial code, placeholder comments (`// TODO`, `// ...`), or any comments suggesting that more tests are needed. The generated test class must be complete and final.
+3.  **COMPLETE & RUNNABLE FILE:** The output must be a single, complete, and runnable Java file. It must start with the package declaration (`package {package_name};`) and include all necessary imports for JUnit 5, Mockito, and the classes under test.
+4.  **MOCKING:**
+    - The test class MUST be annotated with `@ExtendWith(MockitoExtension.class)`.
+    - Use `@Mock` for all dependencies. Detected dependencies are: {', '.join([d['type'].split('.')[-1] + ' ' + d['name'] for d in dependencies]) or 'None'}.
+    - Use `@InjectMocks` for the class under test: `private {class_name} {class_name[0].lower() + class_name[1:]};`.
+5.  **TEST METHOD REQUIREMENTS:**
+    - **Naming:** Follow the `test<MethodName>_<Scenario>` convention (e.g., `testHealth_Success`, `testInitializeModel_Failure`).
+    - **Scenarios:** For each method, provide:
+        - At least one **positive test** (happy path).
+        - **Negative tests** for failure modes (e.g., invalid inputs, exceptions). Use `assertThrows`.
+        - **Edge case tests** where applicable (e.g., null inputs, empty lists).
+    - **Structure:** Strictly follow the **Arrange-Act-Assert** pattern, marked with comments (`// Arrange`, `// Act`, `// Assert`).
+    - **Verification:** Verify mock interactions using `verify()` (e.g., `verify(myMock, times(1)).someMethod(any());`).
 
-    // Assert
-    assertNotNull(result);
-    assertEquals("expected outcome", result);
-    verify(dependency, times(1)).someCall(anyString());
-}}
-```
-
-Provide the complete Java test class file.
+### Final Command
+Generate the complete and final JUnit 5 test class for `{class_name}` now.
 """
         
         try:
+            logger.info(f"Generating single-shot tests for {class_name} with a strict prompt.")
+            # The model type selection is handled here for future extension,
+            # but currently, it always defaults to the V2 model if available.
             if model_type == '6b' and self.deepseek_6b_initialized:
-                 # Local model generation (not implemented in this snippet)
                  raise NotImplementedError("Local 6.7B model generation is not fully implemented here.")
             else:
-                 response = self.generate_with_deepseek_v2(prompt, max_tokens=4000)
+                 response = self.generate_with_deepseek_v2(prompt, max_tokens=8192) # Increased max_tokens
                  generated_text = response['choices'][0]['text']
 
-            # Clean the generated code
+            # Clean the generated code to ensure it's a valid Java file
             return self._clean_generated_code(generated_text, class_name)
                 
         except Exception as e:
-            logger.error(f"Single-shot test generation failed: {e}")
+            logger.error(f"Single-shot test generation failed for {class_name}: {e}")
             return self._generate_fallback_demo_class(class_name, package_name)
-
-    def _generate_tests_chunked(self, java_code, class_name, package_name, model_type="auto"):
-        """
-        Generates tests by splitting the source code into chunks and generating tests for each chunk.
-        This is more reliable for large classes.
-        """
-        all_methods_details = self._extract_methods_with_details(java_code)
-        if not all_methods_details:
-            logger.warning("No methods found to test.")
-            return self._generate_fallback_demo_class(class_name, package_name)
-
-        dependencies = self._extract_dependencies(java_code)
-        value_fields = self._extract_value_fields(java_code)
-        dependencies_declarations = self._format_dependencies_for_prompt(dependencies)
-        class_type = self._get_class_type(java_code)
-        static_calls = self._extract_static_method_calls(java_code)
-
-        chunks = self._split_code_into_chunks(java_code)
-        all_test_methods = []
-
-        for i, chunk in enumerate(chunks):
-            logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-            
-            # Find which methods are in the current chunk
-            methods_in_chunk = [
-                method for method in all_methods_details 
-                if method['name'] in chunk
-            ]
-            if not methods_in_chunk:
-                continue
-
-            # Generate tests for this chunk
-            chunk_test_methods = self._generate_tests_for_chunk(
-                chunk, methods_in_chunk, class_name, dependencies_declarations, 
-                class_type, value_fields, static_calls
-            )
-            all_test_methods.extend(chunk_test_methods)
-            
-        if not all_test_methods:
-            logger.error("No test methods were generated after processing all chunks.")
-            # Fallback to generating a demo class based on all found methods
-            return self._generate_demo_tests(java_code, class_name)
-
-        # Merge all generated test methods into a final class file
-        return self._merge_test_methods_into_class(all_test_methods, class_name, dependencies, value_fields, package_name)
-
-    def _split_code_into_chunks_legacy(self, java_code, lines_per_chunk=100):
-        """A simple legacy method to split code by line count."""
-        lines = java_code.split('\n')
-        chunks = []
-        for i in range(0, len(lines), lines_per_chunk):
-            chunks.append('\n'.join(lines[i:i + lines_per_chunk]))
-        return chunks
-
-    def _split_code_into_chunks(self, java_code, lines_per_chunk=100):
-        """
-        Splits Java code into logical chunks, keeping methods intact.
-        Also includes relevant class-level fields in each chunk.
-        """
-        lines = java_code.split('\n')
-        
-        # Extract class-level content (imports, fields, constructor)
-        class_header = []
-        body_lines = []
-        in_class_body = False
-        brace_level = 0
-        
-        for line in lines:
-            if '{' in line:
-                if not in_class_body:
-                    in_class_body = True
-                brace_level += line.count('{')
-            
-            if '}' in line:
-                brace_level -= line.count('}')
-
-            if in_class_body:
-                body_lines.append(line)
-            else:
-                class_header.append(line)
-        
-        # Simplified: for now, we'll just split by methods.
-        # A more advanced version would handle chunks of multiple methods.
-        
-        methods_with_details = self._extract_methods_with_details(java_code)
-        class_context = self._get_class_context(java_code, methods_with_details)
-        
-        chunks = []
-        # Create a chunk for each method
-        for method in methods_with_details:
-            # This is still not right. We need the method body.
-            # A simple regex to find the method body is brittle.
-            # Let's revert to a simpler chunking for now, but method-aware.
-            pass
-
-        # Let's find method boundaries and split based on them.
-        method_starts = [java_code.find(f"public {m['return_type']} {m['name']}") for m in methods_with_details]
-        method_starts = sorted([m for m in method_starts if m != -1])
-        
-        if not method_starts:
-            return [java_code] # Return the whole thing as one chunk if no methods found
-
-        chunks = []
-        start = 0
-        
-        # The first chunk is everything before the first method
-        # This includes imports, fields, constructors, which is good context.
-        # We might not generate tests for it, but it's needed for context.
-        first_method_start = method_starts[0]
-        # Let's redefine the first chunk to be everything up to the end of the first method
-        # This is getting too complex without a parser.
-        
-        # New strategy: A chunk is a method.
-        method_bodies = self._extract_method_bodies(java_code)
-        for method_name, method_body in method_bodies.items():
-            # Add class context to each method
-            chunk = class_context + "\n\n" + method_body
-            chunks.append(chunk)
-
-        if not chunks:
-            return [java_code]
-
-        return chunks
-
-    def _extract_method_bodies(self, java_code):
-        """
-        A helper to extract full method bodies. Very heuristic.
-        Returns a dict of method_name: full_method_text.
-        """
-        method_bodies = {}
-        methods_details = self._extract_methods_with_details(java_code)
-        
-        for method in methods_details:
-            try:
-                # Find the start of the method signature
-                # This is still not perfect due to overloading.
-                method_signature_start = java_code.find(f"{method['return_type']} {method['name']}")
-                if method_signature_start == -1: continue
-
-                # From there, find the first '{'
-                first_brace = java_code.index('{', method_signature_start)
-                
-                # Scan for the matching '}'
-                brace_level = 1
-                current_pos = first_brace + 1
-                while current_pos < len(java_code) and brace_level > 0:
-                    if java_code[current_pos] == '{': brace_level += 1
-                    if java_code[current_pos] == '}': brace_level -= 1
-                    current_pos += 1
-                
-                # We found the method body
-                method_text = java_code[method_signature_start:current_pos]
-                # Let's also add the public keyword back
-                full_method_text = "public " + method_text
-                method_bodies[method['name']] = full_method_text
-
-            except ValueError:
-                continue
-        
-        return method_bodies
-
-
-    def _format_dependencies_for_prompt(self, dependencies):
-        """Formats the list of dependencies for inclusion in the prompt."""
-        if not dependencies:
-            return "None"
-        
-        declarations = []
-        for dep in dependencies:
-            # Get the simple class name
-            simple_type = dep['type'].split('.')[-1]
-            declarations.append(f"{simple_type} {dep['name']}")
-            
-        return "\n".join([f"- {d}" for d in declarations])
-
-    def _generate_prompt_for_class_type(self, class_type):
-        """Generates specific instructions based on the class stereotype."""
-        if class_type == "Controller":
-            return "For Controller classes, focus on testing API endpoints. Mock service layer calls and verify HTTP status codes and response bodies. Use MockMvc if applicable."
-        if class_type == "Service":
-            return "For Service classes, test the business logic. Mock repository or other service calls. Verify the interactions and the data returned."
-        if class_type == "Repository":
-            return "For Repository classes, tests are often integration tests. For unit tests, you might be testing custom query methods. If using Spring Data, mock the repository interface."
-        return ""
-
-    def _generate_setup_prompt(self, value_fields, class_name, has_object_mapper):
-        """
-        Generates a prompt to create the @BeforeEach setup method.
-        """
-        instructions = [
-            "Create a `@BeforeEach` setup method.",
-            f"`{class_name.lower()} = new {class_name}(...);` should be initialized here if using constructor injection.",
-            "If `RestTemplate` is a dependency, consider setting up a `MockRestServiceServer`."
-        ]
-        
-        if value_fields:
-            instructions.append("Use `ReflectionTestUtils.setField(...)` to inject mocked values for @Value fields.")
-        
-        if has_object_mapper:
-            instructions.append("Initialize the ObjectMapper: `objectMapper = new ObjectMapper();` and inject it if needed.")
-            
-        instruction_str = "\n- ".join(instructions)
-        prompt = f"""Based on the following class context, generate the `@BeforeEach` setup block for the JUnit 5 test class.
-
-**Context:**
-- Class under test: `{class_name}`
-- @Value fields: {', '.join([f[0] for f in value_fields]) if value_fields else 'None'}
-- ObjectMapper present: {has_object_mapper}
-
-**Instructions:**
-- {instruction_str}
-
-**Output only the `@BeforeEach` method code.**
-"""
-        return prompt
-
-    def _generate_tests_for_chunk(self, chunk, methods_in_chunk, class_name, dependencies_declarations, class_type, value_fields, static_calls):
-        """Generate test methods for a chunk of code with improved URL handling"""
-        
-        # Build a map of @Value field names for better test generation
-        value_field_names = [field[0] for field in value_fields] if value_fields else []
-        has_server_url = 'serverUrl' in value_field_names
-        
-        # Prepare the URL construction instruction
-        url_instruction = "Use 'serverUrl + \"/endpoint\"' for URL construction since serverUrl is injected via @Value" if has_server_url else "Use complete hardcoded URLs"
-        
-        # Build the prompt using safe string concatenation to avoid f-string parsing issues.
-        prompt_parts = [
-            "You are a world-class expert Java test engineer specializing in creating comprehensive JUnit 5 tests.\n",
-            "Your task is to generate test methods for a given chunk of Java code.\n\n",
-
-            "### CONTEXT\n",
-            f"- **Class Under Test:** {class_name}\n",
-            f"- **Dependencies Available for Mocking:** {dependencies_declarations}\n",
-            f"- **@Value Fields Available:** {', '.join(value_field_names) if value_field_names else 'None'}\n",
-            f"- **Static method calls detected:** {', '.join(static_calls) if static_calls else 'None'}\n",
-            f"- **Methods to test in this chunk:** {[m['name'] for m in methods_in_chunk]}\n\n",
-
-            "### CODE CHUNK TO TEST\n",
-            f"```java\n{chunk}\n```\n\n",
-
-            "### CRITICAL REQUIREMENTS FOR TEST GENERATION\n",
-            "1.  **Frameworks:** Use **JUnit 5** (`@Test`, `@BeforeEach`, `assertThrows`, etc.) and **Mockito** (`when`, `verify`, `any`, `ArgumentCaptor`).\n",
-            "2.  **Test Naming Convention:** Test methods MUST follow the pattern `test<MethodName>_<Scenario>[_Success | _Failure | _ThrowsException]`.\n",
-            "    - Example: `testProcessLoanDocuments_Success`, `testStoreDocuments_WithInvalidResponse`, `testGetPartnerBankAccount_WhenPartnerNotFound_ThrowsResourceNotFoundException`.\n",
-            "3.  **Structure (Arrange-Act-Assert):** Every test method MUST be clearly structured with comments:\n",
-            "    ```java\n",
-            "    // Arrange\n",
-            "    // ... setup data and mock behavior ...\n\n",
-            "    // Act\n",
-            "    // ... call the method under test ...\n\n",
-            "    // Assert\n",
-            "    // ... assert outcomes and verify mock interactions ...\n",
-            "    ```\n",
-            "4.  **Test Coverage:**\n",
-            "    - **Success Scenarios:** Create at least one test for the primary success path.\n",
-            "    - **Failure Scenarios:** Create tests for expected failures, such as invalid input, empty lists, or null arguments.\n",
-            "    - **Exception Handling:** If a method can throw an exception (e.g., `BusinessException`, `ResourceNotFoundException`), create a test case that verifies the exception is thrown using `assertThrows`. Mock dependencies to throw exceptions (`when(...).thenThrow(...)`).\n",
-            "    - **Edge Cases:** Test for edge cases like empty collections, null values, zero values, etc.\n",
-            "5.  **Mocking and Verification:**\n",
-            "    - **Mocking:** Use `when(mockObject.method(any...)).thenReturn(response)` to define mock behavior. For complex objects, use builders (`YourDTO.builder()...build()`) to construct return values.\n",
-            "    - **Verification:** Use `verify(mockObject, times(1)).method(...)` to check that methods were called. Use `verify(mockObject, never()).method(...)` for methods that should not be called.\n",
-            "6.  **Code Quality:**\n",
-            "    - **No Placeholders:** Generate complete, runnable code. DO NOT use comments like `// TODO`.\n",
-            "    - **Constants:** For recurring values like IDs or strings, consider defining them as `private static final` constants if they were part of the full class context (for this chunk, inline is fine).\n",
-            f"    - **URL Construction:** {url_instruction}\n",
-            "    - **Generics:** Be explicit with generic types in mock return values. For example, use `new ServiceResponse<MyDTO>()` instead of `new ServiceResponse<>()`.\n\n",
-
-            "### OUTPUT FORMAT\n",
-            "Generate **ONLY** the Java code for the `@Test` methods. Do **NOT** include the class declaration, fields, or `@BeforeEach` method. Start directly with the first `@Test` annotation.\n"
-        ]
-        prompt = "".join(prompt_parts)
-        
-        logger.info(f"Generating tests for {len(methods_in_chunk)} methods: {[m['name'] for m in methods_in_chunk]}")
-        
-        try:
-            if self.deepseek_v2_available:
-                response = self.generate_with_deepseek_v2(prompt, max_tokens=3000)
-                generated_text = response['choices'][0]['text']
-            else:
-                # If the primary model isn't available, use fallback
-                logger.warning("Deepseek-V2 model is not available, generating demo test methods")
-                return self._generate_demo_test_methods(methods_in_chunk, class_name)
-            
-            # Extract and clean test methods
-            test_methods = self._extract_test_methods_from_response(generated_text)
-            
-            # Improve URL handling in test methods
-            improved_methods = []
-            for method in test_methods:
-                if has_server_url and 'restTemplate' in method:
-                    # Replace hardcoded URLs with serverUrl + endpoint pattern
-                    method = re.sub(
-                        r'"http://[^"]*/([\w\-]+)"', 
-                        r'serverUrl + "/\1"', 
-                        method
-                    )
-                    # Fix common URL construction issues
-                    method = method.replace('serverUrl + "/', 'serverUrl + "/')
-                improved_methods.append(method)
-            
-            return improved_methods
-            
-        except Exception as e:
-            # Generate demo test methods as fallback instead of failing completely
-            logger.error(f"AI generation failed for chunk: {str(e)}")
-            logger.info("Generating demo test methods as fallback...")
-            return self._generate_demo_test_methods(methods_in_chunk, class_name)
-
-    def _generate_demo_test_methods(self, methods_in_chunk, class_name):
-        """Generate basic demo test methods when AI generation fails"""
-        demo_methods = []
-        
-        for method in methods_in_chunk:
-            method_name = method['name']
-            return_type = method.get('return_type', 'void')
-            
-            if return_type == 'boolean':
-                demo_methods.append(f"""    @Test
-    public void test{method_name.capitalize()}_Success() {{{{
-        // Arrange
-        // TODO: Setup test data and mocks
-        
-        // Act
-        boolean result = {class_name.lower()}.{method_name}();
-        
-        // Assert
-        assertTrue(result);
-    }}}}
-    
-    @Test
-    public void test{method_name.capitalize()}_Failure() {{{{
-        // Arrange
-        // TODO: Setup failure scenario
-        
-        // Act
-        boolean result = {class_name.lower()}.{method_name}();
-        
-        // Assert
-        assertFalse(result);
-    }}}}""")
-            else:
-                demo_methods.append(f"""    @Test
-    public void test{method_name.capitalize()}_Success() {{{{
-        // Arrange
-        // TODO: Setup test data and mocks
-        
-        // Act
-        {return_type} result = {class_name.lower()}.{method_name}();
-        
-        // Assert
-        assertNotNull(result);
-    }}}}""")
-        
-        return demo_methods
-
-    def _extract_test_methods_from_response(self, response_text):
-        """Extracts and cleans individual @Test methods from the AI's response"""
-        
-        # Normalize line endings
-        response_text = response_text.replace('\r\n', '\n')
-        
-        # Remove markdown code block fences
-        response_text = re.sub(r'```java\n?', '', response_text)
-        response_text = re.sub(r'```', '', response_text)
-
-        # Pattern to find methods starting with @Test
-        test_method_pattern = r'(@Test.*?^(?=\s*@Test|\Z))'
-        
-        # Find all test methods
-        test_methods = re.findall(test_method_pattern, response_text, re.DOTALL | re.MULTILINE)
-        
-        # Clean up each method
-        cleaned_methods = []
-        for method in test_methods:
-            # Trim whitespace and ensure it's a valid method
-            method = method.strip()
-            if method.endswith('}') and 'public void' in method:
-                cleaned_methods.append(method)
-
-        # Fallback for when the regex doesn't find methods but there's code
-        if not cleaned_methods and response_text.strip().startswith('@Test'):
-            # Attempt to split by @Test and reconstruct
-            potential_methods = response_text.split('@Test')
-            for potential_method in potential_methods:
-                if 'public void' in potential_method:
-                    method_text = '@Test\n' + potential_method.strip()
-                    if method_text.count('{') == method_text.count('}'):
-                        cleaned_methods.append(method_text)
-        
-        # If still no methods, try a simpler split
-        if not cleaned_methods and "public void test" in response_text:
-             # Look for the start of the first test
-            start_index = response_text.find("@Test")
-            if start_index != -1:
-                # Assume the rest of the text is the method block
-                method_block = response_text[start_index:].strip()
-                # A simple validation
-                if method_block.count('{') == method_block.count('}'):
-                    cleaned_methods.append(method_block)
-        
-        logger.info(f"Extracted {len(cleaned_methods)} test methods.")
-        return cleaned_methods
-
-    def _extract_method_name(self, method_text):
-        """Extracts method name from a test method string"""
-        match = re.search(r'void\s+(test\w+)\s*\(', method_text)
-        if match:
-            return match.group(1)
-        return None
-
-    def _is_test_method_complete(self, method_text):
-        """
-        Check if a generated test method is complete.
-        A complete method should not have placeholder comments.
-        """
-        placeholder_comments = [
-            "// TODO",
-            "// Add assertions here",
-            "// Implement test logic",
-            "// Arrange",
-            "// Act",
-            "// Assert"
-        ]
-        
-        # Check for exact placeholder comments
-        if any(comment in method_text for comment in placeholder_comments):
-            # Further check if there's any actual code in the blocks
-            if "// Arrange" in method_text and "// Act" in method_text:
-                arrange_block = method_text.split("// Arrange")[1].split("// Act")[0].strip()
-                if not arrange_block: return False
-            
-            if "// Act" in method_text and "// Assert" in method_text:
-                act_block = method_text.split("// Act")[1].split("// Assert")[0].strip()
-                if not act_block: return False
-                
-            if "// Assert" in method_text:
-                assert_block = method_text.split("// Assert")[1].strip()
-                # Remove closing brace for check
-                if assert_block.endswith('}'):
-                    assert_block = assert_block[:-1].strip()
-                if not assert_block: return False
-
-        # Check for balanced braces
-        if method_text.count('{') != method_text.count('}'):
-            return False
-            
-        return True
-
-    def _fix_incomplete_test_method(self, method_text):
-        """
-        Uses the AI to fix an incomplete test method.
-        This can be expanded to be more sophisticated.
-        """
-        class_name = self._extract_class_name(method_text) or "UnknownClass"
-        method_name = self._extract_method_name(method_text) or "unknownMethod"
-
-        prompt = f"""The following JUnit test method is incomplete. It may be missing setup, assertions, or contain placeholder comments. 
-Please complete the test method based on the context. Make it a complete, runnable test.
-
-**Incomplete Test Method:**
-```java
-{method_text}
-```
-
-**CRITICAL INSTRUCTIONS:**
-1. Replace all `// TODO` or placeholder comments with real, working Java code.
-2. Ensure the "Arrange" block has proper mock setup (e.g., `when(...).thenReturn(...)`).
-3. Ensure the "Act" block calls the method under test.
-4. Ensure the "Assert" block has meaningful assertions (e.g., `assertEquals`, `assertNotNull`, `assertTrue`) and `verify` calls.
-5. Return ONLY the complete, corrected Java code for the method. Do not include extra explanations.
-
-**Completed Test Method:**
-"""
-        
-        try:
-            response = self.generate_with_deepseek_v2(prompt, max_tokens=1000)
-            fixed_code = response['choices'][0]['text']
-            # Clean up the response
-            fixed_code = fixed_code.strip()
-            if fixed_code.startswith("```java"):
-                fixed_code = fixed_code[7:]
-            if fixed_code.endswith("```"):
-                fixed_code = fixed_code[:-3]
-            
-            return fixed_code.strip()
-        except Exception as e:
-            logger.error(f"Error fixing incomplete test method: {e}")
-            return method_text # Return original on failure
-
-    def _merge_test_methods_into_class(self, all_test_methods, class_name, dependencies, value_fields, package_name):
-        """
-        Merges a list of generated @Test methods into a complete JUnit 5 test class file.
-        """
-        
-        # --- Imports ---
-        imports = {
-            "org.junit.jupiter.api.Test",
-            "org.junit.jupiter.api.extension.ExtendWith",
-            "org.mockito.InjectMocks",
-            "org.mockito.Mock",
-            "org.mockito.junit.jupiter.MockitoExtension"
-        }
-        
-        # Basic assertions
-        imports.add("static org.junit.jupiter.api.Assertions.*")
-        
-        # Mockito static imports
-        imports.add("static org.mockito.Mockito.*")
-        imports.add("static org.mockito.ArgumentMatchers.*")
-        
-        # Add imports based on dependencies
-        for dep in dependencies:
-            if dep['type'] and '.' in dep['type']:
-                imports.add(dep['type'])
-        
-        # Add imports from method bodies
-        full_method_text = "\n".join(all_test_methods)
-        
-        # Find all capitalized words that could be classes (heuristic)
-        potential_classes = re.findall(r'\b[A-Z][\w\.]*\b', full_method_text)
-        
-        # Common Java standard library imports
-        if "List" in potential_classes: imports.add("java.util.List")
-        if "Map" in potential_classes: imports.add("java.util.Map")
-        if "Optional" in potential_classes: imports.add("java.util.Optional")
-        if "Collections" in potential_classes: imports.add("java.util.Collections")
-        if "ArrayList" in potential_classes: imports.add("java.util.ArrayList")
-        if "HashMap" in potential_classes: imports.add("java.util.HashMap")
-        
-        # Add imports for custom DTOs/Entities - This is a heuristic
-        # We assume they are in a package relative to the current package
-        for pc in potential_classes:
-            if pc.endswith("DTO") or pc.endswith("Entity") or pc.endswith("Request") or pc.endswith("Response"):
-                # This is a guess, might need to be smarter
-                base_package = ".".join(package_name.split('.')[:-2])
-                if ".model." in full_method_text:
-                    imports.add(f"{base_package}.model.{pc}")
-                elif ".dto." in full_method_text:
-                    imports.add(f"{base_package}.dto.{pc}")
-                elif ".entity." in full_method_text:
-                    imports.add(f"{base_package}.entity.{pc}")
-
-        
-        sorted_imports = sorted(list(imports))
-        import_statements = "\n".join([f"import {i};" for i in sorted_imports])
-        
-        # --- Fields ---
-        dependency_fields = "\n".join([f"    @Mock\n    private {dep['type'].split('.')[-1]} {dep['name']};" for dep in dependencies])
-        value_field_declarations = "\n".join([f'    @Value("${{{field[1]}}}")\n    private {field[2]} {field[0]};' for field in value_fields])
-
-        # --- Test Class Structure ---
-        test_class_template = f"""package {package_name};
-
-{import_statements}
-
-@ExtendWith(MockitoExtension.class)
-class {class_name}Test {{
-
-    @InjectMocks
-    private {class_name} {class_name.lower()};
-
-{dependency_fields}
-
-{value_field_declarations}
-
-    // You can add a @BeforeEach method here for common setup if needed
-
-{chr(10).join(all_test_methods)}
-}}
-"""
-        
-        return test_class_template
-
-    def _extract_test_methods_from_class(self, java_code):
-        """Extracts methods from a full Java class file for iterative regeneration."""
-        test_method_pattern = r'(@Test.*?}\s*})'
-        return re.findall(test_method_pattern, java_code, re.DOTALL)
-
-    def _validate_generated_code(self, code, class_name):
-        """
-        Validates the generated Java code for basic correctness.
-        Returns a list of error messages.
-        """
-        errors = []
-        
-        # 1. Check for balanced braces
-        if code.count('{') != code.count('}'):
-            errors.append(f"Mismatched curly braces {{}}: {code.count('{')} opening vs {code.count('}')} closing.")
-        
-        # 2. Check for placeholder comments
-        if "// TODO" in code:
-            errors.append("Generated code contains placeholder '// TODO' comments.")
-        
-        # 3. Check for compilation (basic syntax check) - requires a temporary file
-        # This is more complex and may be added later. For now, we rely on syntax hints.
-        
-        # 4. Check for missing @Test annotations
-        public_void_methods = len(re.findall(r'public void test', code))
-        test_annotations = code.count('@Test')
-        if public_void_methods > test_annotations:
-            errors.append(f"Found {public_void_methods} test methods but only {test_annotations} @Test annotations.")
-            
-        return errors
-        
-    def _generate_demo_tests(self, java_code, class_name):
-        """
-        Generates a very basic, non-AI-powered demo test class.
-        This serves as a fallback if the AI fails completely.
-        """
-        package_name = self._extract_package_name(java_code)
-        methods = self._extract_methods(java_code)
-        
-        test_methods = []
-        for method in methods:
-            method_name_cap = method.capitalize()
-            test_methods.append(f"""
-    @Test
-    void test{method_name_cap}_RunsWithoutErrors() {{
-        // This is a basic test to ensure the method can be called without runtime errors.
-        // It does not validate the output.
-        // TODO: Implement a proper test for this method.
-        
-        // Arrange
-        // Mock dependencies for {class_name.lower()} here.
-        
-        try {{
-            // Act
-            {class_name.lower()}.{method}();
-            
-            // Assert
-            // Add assertions here to validate the results.
-            
-        }} catch (Exception e) {{
-            fail("The method '{method}' threw an unexpected exception: " + e.getMessage());
-        }}
-    }}
-""")
-        
-        test_methods_str = "\n".join(test_methods)
-        
-        demo_class = f"""package {package_name};
-
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-
-import static org.junit.jupiter.api.Assertions.fail;
-
-// TODO: This is a basic, AI-generated test class.
-// You need to mock the dependencies and add proper assertions.
-
-@ExtendWith(MockitoExtension.class)
-class {class_name}Test {{
-
-    @InjectMocks
-    private {class_name} {class_name.lower()};
-    
-    // TODO: Add @Mock annotations for all dependencies of {class_name}
-    // Example:
-    // @Mock
-    // private SomeService someService;
-
-{test_methods_str}
-}}
-"""
-        return demo_class
-
-    # --- Utility Methods ---
 
     def _extract_class_name(self, java_code):
         """Extracts the primary public class name from Java code."""
-        class_name_match = re.search(r'public\s+class\s+([\w]+)', java_code)
-        if class_name_match:
-            return class_name_match.group(1)
-        
-        # Fallback for interface or abstract class
-        interface_name_match = re.search(r'public\s+(interface|abstract class)\s+([\w]+)', java_code)
-        if interface_name_match:
-            return interface_name_match.group(2)
+        # Regex to find public class, interface, or enum names
+        name_match = re.search(r'public\s+(?:class|interface|enum)\s+([\w]+)', java_code)
+        if name_match:
+            return name_match.group(1)
             
         return None
 
     def _extract_methods(self, java_code):
         """Extracts public method names from Java code."""
-        # This regex looks for public methods, excluding constructors
         method_pattern = re.compile(r'public\s+(?!class|interface|enum|static\s+final)\s+[\w<>,?]+\s+([a-zA-Z]\w*)\s*\(')
         methods = method_pattern.findall(java_code)
         return methods
@@ -1036,46 +502,22 @@ class {class_name}Test {{
         """
         Cleans the raw output from the AI model to produce a valid Java class file.
         """
-        # Remove markdown fences
-        cleaned_text = re.sub(r'```java\n?', '', generated_text)
+        # Remove markdown fences and surrounding whitespace
+        cleaned_text = re.sub(r'```java\n?', '', generated_text.strip())
         cleaned_text = re.sub(r'```', '', cleaned_text)
         
-        # Find the package declaration
+        # If the AI includes introductory text, find the start of the package declaration
         package_match = re.search(r'package\s+[\w.]+;', cleaned_text)
-        if not package_match:
-            # If no package, something is wrong, return a basic error structure
+        if package_match:
+            # Discard any text before the package declaration
+            cleaned_text = cleaned_text[package_match.start():]
+        else:
+            # If no package declaration, the response is likely malformed
+            logger.warning(f"Could not find package declaration in generated code for {class_name}.")
+            # We can still try to return the text and hope it's usable
             return f"// AI Generation Error: Could not find package declaration.\n{cleaned_text}"
-            
-        package_decl = package_match.group(0)
-        
-        # Find the class declaration
-        class_decl_match = re.search(r'@ExtendWith\(MockitoExtension\.class\)\s+class\s+' + class_name + r'Test\s*\{', cleaned_text, re.DOTALL)
-        if not class_decl_match:
-            return f"// AI Generation Error: Could not find class declaration for {class_name}Test.\n{cleaned_text}"
-            
-        class_start_index = class_decl_match.start()
-        
-        # Extract imports (everything between package and class declaration)
-        imports_section = cleaned_text[len(package_decl):class_start_index].strip()
-        
-        # Extract the class body
-        class_body_start = class_decl_match.end()
-        # Find the corresponding closing brace for the class
-        open_braces = 1
-        current_pos = class_body_start
-        while open_braces > 0 and current_pos < len(cleaned_text):
-            if cleaned_text[current_pos] == '{':
-                open_braces += 1
-            elif cleaned_text[current_pos] == '}':
-                open_braces -= 1
-            current_pos += 1
-            
-        class_body = cleaned_text[class_body_start:current_pos-1].strip()
-        
-        # Reconstruct the class cleanly
-        final_code = f"{package_decl}\n\n{imports_section}\n\n{class_decl_match.group(0)}\n\n{class_body}\n}}\n"
-        
-        return final_code
+
+        return cleaned_text
 
     def check_ollama_running(self):
         """Check if Ollama service is running and accessible."""
