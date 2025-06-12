@@ -1,6 +1,7 @@
 package com.mpokket.testgenerator.controller;
 
 import com.mpokket.testgenerator.service.DeepSeekCoderService;
+import com.mpokket.testgenerator.service.CurlGenerationService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -8,9 +9,18 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 @RestController
 @RequestMapping("/api/deepseek")
@@ -21,6 +31,9 @@ public class DeepSeekTestController {
 
     @Autowired
     private DeepSeekCoderService deepSeekCoderService;
+
+    @Autowired
+    private CurlGenerationService curlGenerationService;
 
     /**
      * Health check endpoint for Deepseek-Coder system
@@ -390,6 +403,79 @@ public class DeepSeekTestController {
             logger.error("Failed to generate and save test for path '{}': {}", filePath, e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                                  .body(Map.of("error", "Failed to process file: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Generates a curl script for a given controller and scenarios.
+     */
+    @PostMapping(value = "/generate-curl-script", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> generateCurlScript(
+            @RequestParam("controllerPath") String controllerPath,
+            @RequestParam(value = "scenariosFile", required = false) MultipartFile scenariosFile) {
+        
+        if (controllerPath == null || controllerPath.trim().isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "controllerPath is required"));
+        }
+
+        try {
+            logger.info("Received request to generate curl script for controller: {}", controllerPath);
+
+            Path controllerFilePath = Paths.get(controllerPath);
+            if (!Files.exists(controllerFilePath)) {
+                 return ResponseEntity.badRequest().body(Map.of("error", "Controller file not found at: " + controllerPath));
+            }
+
+            String scenarios = "";
+            if (scenariosFile != null && !scenariosFile.isEmpty()) {
+                scenarios = new String(scenariosFile.getBytes(), StandardCharsets.UTF_8);
+                logger.info("Received scenarios from uploaded file.");
+            } else {
+                logger.info("No scenarios file provided. AI will generate its own scenarios.");
+            }
+
+            // 1. Call the service to get the script content
+            String scriptContent = curlGenerationService.generateCurlScript(controllerFilePath, scenarios);
+
+            // 2. Save the script to a file in the project's 'scripts' directory
+            Path outputDir = Paths.get("scripts");
+            Files.createDirectories(outputDir);
+            
+            String baseName = controllerFilePath.getFileName().toString().replace(".java", "");
+            String fileName = String.format("run_curls_%s_%d.sh", baseName, System.currentTimeMillis());
+            Path outputFile = outputDir.resolve(fileName);
+
+            Files.write(outputFile, scriptContent.getBytes(StandardCharsets.UTF_8));
+
+            // 3. Make the script executable (for non-Windows systems)
+            if (!System.getProperty("os.name").toLowerCase().startsWith("windows")) {
+                Set<PosixFilePermission> perms = new HashSet<>();
+                perms.add(PosixFilePermission.OWNER_READ);
+                perms.add(PosixFilePermission.OWNER_WRITE);
+                perms.add(PosixFilePermission.OWNER_EXECUTE);
+                perms.add(PosixFilePermission.GROUP_READ);
+                perms.add(PosixFilePermission.GROUP_EXECUTE);
+                perms.add(PosixFilePermission.OTHERS_READ);
+                perms.add(PosixFilePermission.OTHERS_EXECUTE);
+                Files.setPosixFilePermissions(outputFile, perms);
+            }
+            
+            logger.info("Successfully generated and saved curl script to: {}", outputFile.toString());
+
+            return ResponseEntity.ok(Map.of(
+                "status", "success",
+                "message", "Curl script generated successfully.",
+                "scriptPath", outputFile.toAbsolutePath().toString()
+            ));
+
+        } catch (IOException e) {
+            logger.error("IO error during curl script generation for '{}': {}", controllerPath, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                                 .body(Map.of("error", "Failed to write script file: " + e.getMessage()));
+        } catch (Exception e) {
+            logger.error("Failed to generate curl script for '{}': {}", controllerPath, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                                 .body(Map.of("error", "An unexpected error occurred: " + e.getMessage()));
         }
     }
 } 
