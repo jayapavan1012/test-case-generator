@@ -35,11 +35,11 @@ class DeepSeekV2Generator:
     to a local 6.7B GGUF model if specified.
     """
     
-    def __init__(self, ollama_base_url="http://localhost:11434"):
+    def __init__(self, ollama_base_url="http://localhost:11434", deepseek_model_name="deepseek-coder-v2:16b"):
         # Primary Ollama Deepseek-V2 model
         self.ollama_base_url = ollama_base_url
         self.ollama_api_url = f"{ollama_base_url}/api/generate"
-        self.deepseek_v2_model_name = "deepseek-coder-v2"
+        self.deepseek_v2_model_name = deepseek_model_name
         self.deepseek_v2_available = False
         
         # Fallback local Llama-cpp model
@@ -1452,6 +1452,7 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to.")
     parser.add_argument("--port", type=int, default=9092, help="Port to run the server on.")
     parser.add_argument("--ollama-url", type=str, default="http://localhost:11434", help="URL of the Ollama server.")
+    parser.add_argument("--deepseek-model", type=str, default="deepseek-coder-v2:16b", help="Name of the Deepseek model to use (e.g., deepseek-coder-v2:16b).")
     parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level.")
     parser.add_argument("--use-gpu", action='store_true', help="Enable GPU for the local 6.7B model (if a path is provided later).")
     parser.add_argument("--model-path", type=str, default=None, help="Path to the local GGuf model file for the 6.7B fallback.")
@@ -1461,7 +1462,7 @@ def main():
     logging.basicConfig(level=args.log_level, format='%(asctime)s - %(levelname)s - %(message)s')
     
     # Initialize the generator
-    generator = DeepSeekV2Generator(ollama_base_url=args.ollama_url)
+    generator = DeepSeekV2Generator(ollama_base_url=args.ollama_url, deepseek_model_name=args.deepseek_model)
     
     # Optionally initialize the 6.7B model at startup
     if args.model_path:
