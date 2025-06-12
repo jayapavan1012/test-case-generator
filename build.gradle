@@ -1,5 +1,7 @@
 plugins {
     id 'java'
+    id 'maven-publish'
+
     id 'org.springframework.boot' version '3.2.3'
     id 'io.spring.dependency-management' version '1.1.4'
 }
@@ -7,6 +9,30 @@ plugins {
 group = 'com.mpokket'
 version = '1.0.0-DEEPSEEK'
 java.sourceCompatibility = JavaVersion.VERSION_17
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+
+            groupId = 'com.mpokket'
+            artifactId = 'test-generator'
+            version = '1.0.0-DEEPSEEK'
+
+            versionMapping {
+                usage('java-api') {
+                    fromResolutionResult()
+                }
+                usage('java-runtime') {
+                    fromResolutionResult()
+                }
+            }
+        }
+    }
+    repositories {
+        mavenLocal()
+    }
+}
 
 repositories {
     mavenCentral()
@@ -39,10 +65,6 @@ dependencies {
 
     // Configuration Processor
     annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
-}
-
-tasks.withType(GenerateModuleMetadata) {
-    enabled = false
 }
 
 tasks.named('test') {
