@@ -74,7 +74,7 @@ class DeepSeekV2Generator:
         """
         if not self.deepseek_v2_available:
             raise RuntimeError("Deepseek-V2 model is not available on Ollama.")
-            
+
         payload = {
             "model": self.deepseek_v2_model_name,
             "prompt": prompt,
@@ -86,7 +86,9 @@ class DeepSeekV2Generator:
                 "num_predict": max_tokens or 4096
             }
         }
+        
         try:
+            logger.info(f"Attempting to generate with Ollama using POST {self.ollama_api_url}")
             response = requests.post(self.ollama_api_url, json=payload, timeout=300)
             response.raise_for_status()
             
@@ -98,12 +100,22 @@ class DeepSeekV2Generator:
             # but let's structure it like the OpenAI API for consistency
             return {"choices": [{"text": generated_text}]}
 
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Cannot connect to Ollama at {self.ollama_base_url}. Is Ollama running?")
+            raise RuntimeError(f"Ollama connection failed: {e}")
         except requests.exceptions.Timeout:
             logger.error("Request to Ollama timed out.")
-            raise
+            raise RuntimeError("Ollama request timed out")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.error(f"Ollama API endpoint not found. Check if Ollama is running and the model '{self.deepseek_v2_model_name}' is available.")
+                raise RuntimeError(f"Ollama API not found (404). Is Ollama running with the correct model?")
+            else:
+                logger.error(f"HTTP error from Ollama: {e}")
+                raise RuntimeError(f"Ollama HTTP error: {e}")
         except requests.exceptions.RequestException as e:
             logger.error(f"An error occurred with the Ollama request: {e}")
-            raise
+            raise RuntimeError(f"Ollama request failed: {e}")
 
     def initialize_deepseek_6b_model(self, model_path, use_gpu=True):
         """Initializes the local 6.7B parameter model using llama-cpp-python."""
@@ -608,8 +620,9 @@ Provide the complete Java test class file.
                 response = self.generate_with_deepseek_v2(prompt, max_tokens=3000)
                 generated_text = response['choices'][0]['text']
             else:
-                # Fallback generation
-                generated_text = self._generate_demo_test_methods(methods_in_chunk, class_name)
+                # If the primary model isn't available, use fallback
+                logger.warning("Deepseek-V2 model is not available, generating demo test methods")
+                return self._generate_demo_test_methods(methods_in_chunk, class_name)
             
             # Extract and clean test methods
             test_methods = self._extract_test_methods_from_response(generated_text)
@@ -631,7 +644,9 @@ Provide the complete Java test class file.
             return improved_methods
             
         except Exception as e:
-            logger.error(f"Error generating tests for chunk: {str(e)}")
+            # Generate demo test methods as fallback instead of failing completely
+            logger.error(f"AI generation failed for chunk: {str(e)}")
+            logger.info("Generating demo test methods as fallback...")
             return self._generate_demo_test_methods(methods_in_chunk, class_name)
 
     def _generate_demo_test_methods(self, methods_in_chunk, class_name):
@@ -1062,6 +1077,14 @@ class {class_name}Test {{
         
         return final_code
 
+    def check_ollama_running(self):
+        """Check if Ollama service is running and accessible."""
+        try:
+            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=5)
+            return response.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
     def get_system_info(self):
         """Returns a dictionary with system information."""
         return {
@@ -1131,9 +1154,8 @@ class {class_name}Test {{
             r'(\w+);'             # Group 2: The field name
         )
         # The regex groups are: (key, type, name)
-        found_values = value_pattern.findall(java_code)
-        # Returns a list of tuples: (fieldName, propertyKey, fieldType)
         # Example: ('serverUrl', 'server.url', 'String')
+        found_values = value_pattern.findall(java_code)
         return [(name, key, dtype) for key, dtype, name in found_values]
 
     def _generate_fallback_demo_class(self, class_name, package_name=None):
@@ -1179,11 +1201,25 @@ generator = None
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint."""
+    if not generator:
+        return jsonify({
+            "status": "error",
+            "message": "Generator not initialized"
+        }), 503
+    
+    ollama_running = generator.check_ollama_running()
+    
     return jsonify({
-        "status": "ok",
-        "deepseek_v2_online": generator.deepseek_v2_available if generator else False,
-        "deepseek_6b_initialized": generator.deepseek_6b_initialized if generator else False,
-        "system_info": generator.get_system_info() if generator else {}
+        "status": "ok" if ollama_running or generator.deepseek_6b_initialized else "degraded",
+        "ollama": {
+            "running": ollama_running,
+            "url": generator.ollama_base_url,
+            "deepseek_v2_available": generator.deepseek_v2_available
+        },
+        "fallback_model": {
+            "deepseek_6b_initialized": generator.deepseek_6b_initialized
+        },
+        "system_info": generator.get_system_info()
     }), 200
 
 @app.route('/models/status', methods=['GET'])
@@ -1225,48 +1261,180 @@ def initialize_model():
         logger.error(f"Failed to initialize 6.7B model: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/troubleshoot', methods=['GET'])
+def troubleshoot():
+    """Troubleshooting endpoint to diagnose Ollama connectivity issues."""
+    if not generator:
+        return jsonify({"error": "Generator not initialized"}), 503
+    
+    diagnostics = {
+        "ollama_base_url": generator.ollama_base_url,
+        "ollama_api_url": generator.ollama_api_url,
+        "tests": {}
+    }
+    
+    # Test 1: Basic connectivity
+    try:
+        response = requests.get(f"{generator.ollama_base_url}/api/tags", timeout=5)
+        diagnostics["tests"]["connectivity"] = {
+            "status": "success",
+            "response_code": response.status_code,
+            "message": "Ollama is accessible"
+        }
+    except requests.exceptions.ConnectionError:
+        diagnostics["tests"]["connectivity"] = {
+            "status": "failed",
+            "error": "Connection refused",
+            "message": "Ollama is not running or not accessible"
+        }
+    except requests.exceptions.Timeout:
+        diagnostics["tests"]["connectivity"] = {
+            "status": "failed",
+            "error": "Timeout",
+            "message": "Ollama is running but not responding"
+        }
+    except Exception as e:
+        diagnostics["tests"]["connectivity"] = {
+            "status": "failed",
+            "error": str(e),
+            "message": "Unknown connectivity issue"
+        }
+    
+    # Test 2: Model availability
+    try:
+        response = requests.get(f"{generator.ollama_base_url}/api/tags", timeout=5)
+        if response.status_code == 200:
+            models = response.json().get('models', [])
+            model_names = [model['name'] for model in models]
+            deepseek_models = [name for name in model_names if 'deepseek' in name.lower()]
+            
+            diagnostics["tests"]["models"] = {
+                "status": "success",
+                "available_models": model_names,
+                "deepseek_models": deepseek_models,
+                "target_model": generator.deepseek_v2_model_name,
+                "model_found": any(generator.deepseek_v2_model_name in name for name in model_names)
+            }
+        else:
+            diagnostics["tests"]["models"] = {
+                "status": "failed",
+                "message": f"Got HTTP {response.status_code} when checking models"
+            }
+    except Exception as e:
+        diagnostics["tests"]["models"] = {
+            "status": "failed",
+            "error": str(e),
+            "message": "Could not check available models"
+        }
+    
+    # Suggestions
+    suggestions = []
+    if diagnostics["tests"]["connectivity"]["status"] == "failed":
+        suggestions.extend([
+            "1. Check if Ollama is installed: `ollama --version`",
+            "2. Start Ollama service: `ollama serve`",
+            "3. Check if Ollama is running on the correct port (default: 11434)",
+            "4. Verify firewall settings if running on different hosts"
+        ])
+    
+    if diagnostics["tests"].get("models", {}).get("status") == "success":
+        if not diagnostics["tests"]["models"].get("model_found", False):
+            suggestions.extend([
+                f"5. Pull the required model: `ollama pull {generator.deepseek_v2_model_name}`",
+                "6. Check available models: `ollama list`"
+            ])
+    
+    diagnostics["suggestions"] = suggestions
+    
+    return jsonify(diagnostics)
 
 @app.route('/generate', methods=['POST'])
 def generate():
     """Main endpoint to generate JUnit tests."""
     start_time = time.time()
     
+    logger.info("--- Received request for /generate ---")
+    logger.info(f"Request Headers: {request.headers}")
+    
     if not generator:
+        logger.error("Generator service not available at /generate endpoint.")
         return jsonify({"error": "Generator service not available"}), 503
         
-    data = request.json
-    java_code = data.get('java_code')
-    class_name = data.get('class_name')
-    model_type = data.get('model_type', 'auto') # 'auto', 'v2', '6b'
+    data = request.get_json(silent=True)
+    if not data:
+        logger.error(f"Malformed request: body is not valid JSON. Request body: {request.data}")
+        return jsonify({"error": "Request must be a valid JSON"}), 400
     
+    logger.info(f"Received JSON data: {data}")
+
+    # Align with Java client which sends 'prompt' and 'className'
+    java_code = data.get('prompt')
+    class_name = data.get('className')
+    # Align with Java client which sends 'model'
+    model_type = data.get('model', 'auto')
+        
     if not java_code:
-        return jsonify({"error": "java_code is required"}), 400
+        logger.error("Validation failed: 'prompt' key with java_code string is missing.")
+        return jsonify({"error": "A 'prompt' string containing java_code is required"}), 400
     
     if not class_name:
         class_name = generator._extract_class_name(java_code)
         if not class_name:
+            logger.error(f"Could not determine class name from the provided java_code.")
             return jsonify({"error": "Could not determine class name from java_code. Please provide it."}), 400
     
     try:
         logger.info(f"Generating tests for class: {class_name} with model: {model_type}")
+        
+        # Check if Ollama is available before proceeding
+        if model_type != '6b' and not generator.check_ollama_running():
+            logger.warning("Ollama is not running. Attempting to generate with fallback methods.")
+            # Try to generate anyway, the fallback will kick in during chunk processing
+        
         generated_tests = generator.generate_junit_tests(java_code, class_name, model_type)
         
         end_time = time.time()
         duration = end_time - start_time
         
-        validation_errors = generator._validate_generated_code(generated_tests, class_name)
+        # Check if we used fallback methods
+        warnings = []
+        if not generator.check_ollama_running():
+            warnings.append("Generated using fallback methods due to Ollama unavailability")
         
+        # Align response with what the Java client expects
         return jsonify({
+            "response": generated_tests,
             "class_name": class_name,
-            "generated_test_code": generated_tests,
             "generation_time_seconds": round(duration, 2),
-            "validation_errors": validation_errors,
-            "model_used": model_type # This could be refined to return actual model used
+            "model_used": model_type,
+            "model_requested": data.get('model', 'auto'),
+            "available_models": {
+                "deepseek-v2": generator.deepseek_v2_available,
+                "deepseek-6b": generator.deepseek_6b_initialized
+            },
+            "warnings": warnings
         })
         
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-        return jsonify({"error": f"An internal error occurred: {e}"}), 500
+        
+        # Provide more specific error messages
+        if "Ollama" in str(e) or "404" in str(e):
+            return jsonify({
+                "error": "Ollama service is not available",
+                "details": str(e),
+                "troubleshooting": {
+                    "check_health": "/health",
+                    "troubleshoot": "/troubleshoot",
+                    "suggestions": [
+                        "Ensure Ollama is running: `ollama serve`",
+                        f"Pull the required model: `ollama pull {generator.deepseek_v2_model_name}`",
+                        "Check Ollama status: `ollama list`"
+                    ]
+                }
+            }), 503
+        else:
+            return jsonify({"error": f"An internal error occurred: {e}"}), 500
 
 
 @app.errorhandler(404)
