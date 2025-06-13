@@ -74,7 +74,7 @@ public class CurlGenerationService {
      * @param controllerPath The path to the controller file.
      * @return A map of DTO file names to their source code.
      */
-    private Map<String, String> findAndReadDtos(String controllerCode, Path controllerPath) {
+    Map<String, String> findAndReadDtos(String controllerCode, Path controllerPath) {
         Map<String, String> dtoCodes = new HashMap<>();
         
         // Regex to find class names inside @RequestBody annotations

@@ -45,11 +45,13 @@ public class DeepSeekCoderService {
     
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
+    private final CurlGenerationService curlGenerationService;
     private boolean modelReady = false;
     
-    public DeepSeekCoderService() {
+    public DeepSeekCoderService(CurlGenerationService curlGenerationService) {
         this.restTemplate = new RestTemplate();
         this.objectMapper = new ObjectMapper();
+        this.curlGenerationService = curlGenerationService;
         
         // Configure timeout for Deepseek-V2 (larger model = longer generation)
         this.restTemplate.getMessageConverters().forEach(converter -> {
@@ -174,16 +176,23 @@ public class DeepSeekCoderService {
      * Generate JUnit test cases using Deepseek-Coder-V2:16b (Primary) with fallback
      */
     public String generateTestCases(String javaCode, String className) {
-        return generateTestCases(javaCode, className, "auto");
+        return generateTestCases(javaCode, className, "auto", null);
     }
     
     /**
      * Generate JUnit test cases with specific model selection
      */
     public String generateTestCases(String javaCode, String className, String modelType) {
+        return generateTestCases(javaCode, className, modelType, null);
+    }
+
+    /**
+     * Generate JUnit test cases with additional context (DTOs, etc.)
+     */
+    public String generateTestCases(String javaCode, String className, String modelType, Map<String, String> additionalContext) {
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                String response = callDeepSeekCoderServer(javaCode, className, modelType);
+                String response = callDeepSeekCoderServer(javaCode, className, modelType, additionalContext);
                 logger.info("Successfully generated test cases for class: {} (length: {} chars)", 
                            className, response.length());
                 return response;
@@ -210,9 +219,16 @@ public class DeepSeekCoderService {
     }
     
     /**
-     * Call Deepseek-Coder server with optimized payload for V2 model
+     * Call Deepseek-Coder server with optimized payload for V2 model (backward compatibility)
      */
     private String callDeepSeekCoderServer(String javaCode, String className, String modelType) throws Exception {
+        return callDeepSeekCoderServer(javaCode, className, modelType, null);
+    }
+
+    /**
+     * Call Deepseek-Coder server with optimized payload for V2 model and additional context
+     */
+    private String callDeepSeekCoderServer(String javaCode, String className, String modelType, Map<String, String> additionalContext) throws Exception {
         String generateUrl = serverUrl + "/generate";
         
         // Create optimized request payload for Deepseek-V2
@@ -228,6 +244,11 @@ public class DeepSeekCoderService {
             requestBody.put("model", modelType.trim()); // "auto", "deepseek-v2", "deepseek-6b"
         } else {
             requestBody.put("model", autoModelSelection ? "auto" : primaryModel);
+        }
+
+        // NEW: Add additional context (DTOs, imports, etc.) if provided
+        if (additionalContext != null && !additionalContext.isEmpty()) {
+            requestBody.put("additional_context", additionalContext);
         }
         
         HttpHeaders headers = new HttpHeaders();
@@ -438,6 +459,9 @@ public class DeepSeekCoderService {
                 className, className, className.toLowerCase(), className.toLowerCase());
     }
 
+    /**
+     * Enhanced version of generateTestAndSave that includes DTO discovery and additional context
+     */
     public Map<String, String> generateTestAndSave(String sourceFilePath) throws IOException {
         logger.info("Reading java file from path: {}", sourceFilePath);
         if (sourceFilePath == null || sourceFilePath.trim().isEmpty()) {
@@ -451,8 +475,36 @@ public class DeepSeekCoderService {
         String javaCode = new String(Files.readAllBytes(sourcePath));
         String className = extractClassName(javaCode);
         
-        // This existing method already calls the python service
-        String generatedTests = generateTestCases(javaCode, className);
+        // NEW: Discover DTOs and additional context using CurlGenerationService logic
+        Map<String, String> additionalContext = new HashMap<>();
+        
+        try {
+            // Reuse the DTO discovery logic from CurlGenerationService
+            Map<String, String> dtoCodes = findAndReadDtos(javaCode, sourcePath);
+            if (!dtoCodes.isEmpty()) {
+                additionalContext.putAll(dtoCodes);
+                logger.info("Discovered {} DTOs for enhanced test generation", dtoCodes.size());
+            }
+            
+            // Extract package information
+            String packageName = extractPackageName(javaCode);
+            if (packageName != null && !packageName.isEmpty()) {
+                additionalContext.put("package_name", packageName);
+            }
+            
+            // Extract imports that might be relevant
+            String imports = extractRelevantImports(javaCode);
+            if (imports != null && !imports.isEmpty()) {
+                additionalContext.put("imports", imports);
+            }
+            
+        } catch (Exception e) {
+            logger.warn("Failed to discover additional context for {}: {}", className, e.getMessage());
+            // Continue with basic generation if context discovery fails
+        }
+        
+        // Generate tests with enhanced context
+        String generatedTests = generateTestCases(javaCode, className, "auto", additionalContext);
 
         // Determine the correct test file path
         String testFilePath = sourceFilePath.replace("src/main/java", "src/test/java");
@@ -464,11 +516,120 @@ public class DeepSeekCoderService {
 
         logger.info("Successfully wrote generated test to: {}", testFilePath);
 
-        // For now, we can hardcode the model used or retrieve it if the python service returns it
         return Map.of(
             "testFilePath", testFilePath,
-            "modelUsed", "Deepseek-Coder Multi-Model" 
+            "modelUsed", "Deepseek-Coder Multi-Model (Enhanced with Context)",
+            "contextItemsFound", String.valueOf(additionalContext.size())
         );
+    }
+
+    /**
+     * Reuse DTO discovery logic from CurlGenerationService
+     */
+    private Map<String, String> findAndReadDtos(String javaCode, Path javaFilePath) {
+        Map<String, String> dtoCodes = new HashMap<>();
+        
+        // Regex to find class names inside @RequestBody annotations, method parameters, and fields
+        Pattern requestBodyPattern = Pattern.compile("@RequestBody\\s+([\\w\\.<>]+)\\s+\\w+");
+        Pattern fieldPattern = Pattern.compile("private\\s+([\\w\\.<>]+)\\s+\\w+;");
+        Pattern methodParamPattern = Pattern.compile("\\((.*?)\\)");
+        
+        // Find @RequestBody DTOs
+        findDtosWithPattern(javaCode, javaFilePath, requestBodyPattern, dtoCodes);
+        
+        // Find field DTOs (for services and controllers)
+        findDtosWithPattern(javaCode, javaFilePath, fieldPattern, dtoCodes);
+        
+        return dtoCodes;
+    }
+    
+    private void findDtosWithPattern(String javaCode, Path javaFilePath, Pattern pattern, Map<String, String> dtoCodes) {
+        java.util.regex.Matcher matcher = pattern.matcher(javaCode);
+        
+        while (matcher.find()) {
+            String dtoClassName = matcher.group(1);
+            
+            // Handle generic types like List<UserDto>
+            if (dtoClassName.contains("<")) {
+                dtoClassName = dtoClassName.substring(dtoClassName.indexOf("<") + 1, dtoClassName.indexOf(">"));
+            }
+            
+            // Skip primitive types and common Java types
+            if (isPrimitiveOrCommonType(dtoClassName)) {
+                continue;
+            }
+            
+            logger.debug("Found potential DTO: {}", dtoClassName);
+
+            try {
+                Path dtoPath = findDtoPathFromImports(javaCode, javaFilePath, dtoClassName);
+                if (dtoPath != null && Files.exists(dtoPath)) {
+                    String dtoCode = new String(Files.readAllBytes(dtoPath));
+                    dtoCodes.put(dtoPath.getFileName().toString(), dtoCode);
+                    logger.debug("Successfully read DTO file: {}", dtoPath);
+                }
+            } catch (IOException e) {
+                logger.warn("Error reading DTO file for class {}: {}", dtoClassName, e.getMessage());
+            }
+        }
+    }
+    
+    private boolean isPrimitiveOrCommonType(String className) {
+        return className.matches("(String|Integer|Long|Double|Float|Boolean|int|long|double|float|boolean|" +
+                                "List|Set|Map|Collection|Object|HttpServletRequest|HttpServletResponse|" +
+                                "ResponseEntity|Model|ModelAndView)");
+    }
+    
+    private Path findDtoPathFromImports(String javaCode, Path javaFilePath, String dtoClassName) {
+        Pattern importPattern = Pattern.compile("import\\s+([\\w\\.]+\\." + dtoClassName + ");");
+        java.util.regex.Matcher importMatcher = importPattern.matcher(javaCode);
+
+        if (importMatcher.find()) {
+            String fullClassName = importMatcher.group(1);
+            String relativePath = fullClassName.replace('.', '/') + ".java";
+            
+            Path current = javaFilePath.getParent();
+            while(current != null) {
+                Path potentialPath = current.resolve(relativePath);
+                if (Files.exists(potentialPath)) {
+                    return potentialPath;
+                }
+                if(current.endsWith("src/main/java") || current.endsWith("src\\main\\java")) {
+                     Path resolvedPath = Paths.get(current.toString(), relativePath);
+                     if(Files.exists(resolvedPath)) {
+                         return resolvedPath;
+                     }
+                     break; 
+                }
+                current = current.getParent();
+            }
+        }
+        return null;
+    }
+    
+    private String extractPackageName(String javaCode) {
+        Pattern packagePattern = Pattern.compile("package\\s+([\\w\\.]+);");
+        java.util.regex.Matcher matcher = packagePattern.matcher(javaCode);
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return null;
+    }
+    
+    private String extractRelevantImports(String javaCode) {
+        Pattern importPattern = Pattern.compile("import\\s+([\\w\\.]+);");
+        java.util.regex.Matcher matcher = importPattern.matcher(javaCode);
+        StringBuilder imports = new StringBuilder();
+        
+        while (matcher.find()) {
+            String importStatement = matcher.group(1);
+            // Only include non-standard library imports that might be relevant for testing
+            if (!importStatement.startsWith("java.") && !importStatement.startsWith("javax.")) {
+                imports.append(importStatement).append("\n");
+            }
+        }
+        
+        return imports.toString();
     }
 
     private String extractClassName(String javaCode) {

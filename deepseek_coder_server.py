@@ -74,7 +74,7 @@ class DeepSeekV2Generator:
         """
         if not self.deepseek_v2_available:
             raise RuntimeError("Deepseek-V2 model is not available on Ollama.")
-
+            
         payload = {
             "model": self.deepseek_v2_model_name,
             "prompt": prompt,
@@ -220,7 +220,7 @@ class DeepSeekV2Generator:
         
         # Iteratively remove method bodies
         for method in methods_with_details:
-             # Build a regex to find the specific method signature and its body
+            # Build a regex to find the specific method signature and its body
             method_name = method['name']
             # This is tricky without a full parser. We'll find the method signature
             # and then find the opening brace and its matching closing brace.
@@ -248,34 +248,278 @@ class DeepSeekV2Generator:
             return "Component"
         return "Class"
 
-    def _create_chunk_generation_prompt(self, java_code, class_name, package_name, method_chunk):
+    def _create_chunk_generation_prompt(self, java_code, class_name, package_name, method_chunk, additional_context=None):
         """Creates a prompt to generate tests for a small chunk of methods."""
         method_list = "\n".join([f"- `{m['return_type']} {m['name']}(...);`" for m in method_chunk])
         
-        return f"""You are a Java test engineer. Your task is to write JUnit 5 test methods for a specific set of methods from a Java class.
+        # Enhanced context section
+        context_section = ""
+        enhanced_guidance = ""
+        flow_analysis_section = ""
+        
+        if additional_context:
+            # Process DTOs and related Java files
+            dto_files = {k: v for k, v in additional_context.items() if k.endswith('.java')}
+            if dto_files:
+                context_section += "\n### Available DTOs and Related Classes\n"
+                for dto_name, dto_code in dto_files.items():
+                    context_section += f"#### {dto_name}\n```java\n{dto_code}\n```\n\n"
+            
+            # Add package information if available
+            if 'package_name' in additional_context:
+                context_section += f"\n### Package Information\n```\nPackage: {additional_context['package_name']}\n```\n\n"
+            
+            # Add imports if available
+            if 'imports' in additional_context:
+                context_section += f"\n### Relevant Imports\n```java\n{additional_context['imports']}\n```\n\n"
+            
+            # Add class-specific guidance
+            if 'class_characteristics' in additional_context:
+                characteristics = additional_context['class_characteristics']
+                enhanced_guidance = self._get_enhanced_test_guidance(characteristics)
+                context_section += f"\n### Class-Specific Test Guidance\n{enhanced_guidance}\n\n"
+            
+            # Add flow analysis for targeted methods
+            if 'flow_analysis' in additional_context:
+                flow_analysis = additional_context['flow_analysis']
+                method_names = [m['name'] for m in method_chunk]
+                
+                # Build targeted flow analysis for this chunk
+                relevant_flows = {}
+                for method_name in method_names:
+                    if method_name in flow_analysis['method_flows']:
+                        relevant_flows[method_name] = flow_analysis['method_flows'][method_name]
+                
+                if relevant_flows:
+                    flow_analysis_section = "\n### DETAILED FLOW ANALYSIS FOR TARGET METHODS\n"
+                    flow_analysis_section += "Use this analysis to generate comprehensive tests that cover all execution paths:\n\n"
+                    
+                    for method_name, flow_data in relevant_flows.items():
+                        flow_analysis_section += f"#### Method: {method_name}\n"
+                        
+                        # Conditional branches
+                        if method_name in flow_analysis['conditional_branches']:
+                            branches = flow_analysis['conditional_branches'][method_name]
+                            if branches.get('if_statements') or branches.get('switch_cases') or branches.get('ternary_operators'):
+                                flow_analysis_section += "**Conditional Branches to Test:**\n"
+                                for if_stmt in branches.get('if_statements', []):
+                                    flow_analysis_section += f"- IF condition: `{if_stmt}` (test both true/false paths)\n"
+                                for switch_case in branches.get('switch_cases', []):
+                                    flow_analysis_section += f"- SWITCH case: `{switch_case}` (test each case + default)\n"
+                                for ternary in branches.get('ternary_operators', []):
+                                    flow_analysis_section += f"- TERNARY: `{ternary}` (test both conditions)\n"
+                        
+                        # Exception paths
+                        if method_name in flow_analysis['exception_paths']:
+                            exceptions = flow_analysis['exception_paths'][method_name]
+                            if exceptions.get('thrown_exceptions') or exceptions.get('caught_exceptions'):
+                                flow_analysis_section += "**Exception Scenarios to Test:**\n"
+                                for thrown in exceptions.get('thrown_exceptions', []):
+                                    flow_analysis_section += f"- Test exception: `{thrown}` (verify proper throwing)\n"
+                                for caught in exceptions.get('caught_exceptions', []):
+                                    flow_analysis_section += f"- Test catch block: `{caught}` (verify error handling)\n"
+                        
+                        # Dependency interactions
+                        if method_name in flow_analysis['dependency_interactions']:
+                            deps = flow_analysis['dependency_interactions'][method_name]
+                            if deps.get('service_calls') or deps.get('repository_calls'):
+                                flow_analysis_section += "**Dependency Interactions to Mock/Verify:**\n"
+                                for service_call in deps.get('service_calls', []):
+                                    flow_analysis_section += f"- Mock service call: `{service_call}`\n"
+                                for repo_call in deps.get('repository_calls', []):
+                                    flow_analysis_section += f"- Mock repository call: `{repo_call}`\n"
+                        
+                        flow_analysis_section += "\n"
+            
+            # Add any other context items
+            other_context = {k: v for k, v in additional_context.items() 
+                           if not k.endswith('.java') and k not in ['package_name', 'imports', 'class_characteristics', 'flow_analysis']}
+            if other_context:
+                context_section += "\n### Additional Context\n"
+                for key, value in other_context.items():
+                    context_section += f"#### {key}\n```\n{value}\n```\n\n"
+        
+        return f"""You are a Java test engineer with expertise in code flow analysis. Your task is to write comprehensive JUnit 5 test methods for a specific set of methods from a Java class.
 
 ### Full Class Context (for reference only)
 ```java
 {java_code}
 ```
 
-### INSTRUCTIONS
-- Write complete, runnable JUnit 5 `@Test` methods for the following methods ONLY:
-{method_list}
-- For each method, provide at least one positive and one negative test case.
-- Use the Arrange-Act-Assert pattern.
-- Assume all necessary mocks (`@Mock`) and the class under test (`@InjectMocks private {class_name} {class_name[0].lower() + class_name[1:]};`) are already defined in the test class.
-- DO NOT write the class definition, package statement, or imports.
-- DO NOT write `@BeforeEach` or other setup methods.
-- ONLY output the test methods themselves, without any surrounding markdown.
+{context_section}
 
-Generate the test methods now.
+{flow_analysis_section}
+
+### TARGET METHODS FOR TESTING:
+Generate comprehensive tests for these methods ONLY:
+{method_list}
+
+### COMPREHENSIVE TEST GENERATION INSTRUCTIONS:
+
+#### 1. FLOW-BASED TEST STRATEGY
+**Use the flow analysis above to ensure complete coverage:**
+- Test every conditional branch identified (if/else, switch cases, ternary operators)
+- Test every exception path (both thrown and caught exceptions)
+- Mock and verify every dependency interaction identified
+- Test all data transformation scenarios
+- Cover all validation points and edge cases
+
+#### 2. TEST METHOD STRUCTURE
+**For EACH method above, create multiple test scenarios:**
+
+**A. Success/Happy Path Tests:**
+- Test normal execution with valid inputs
+- Test each conditional branch (true path)
+- Verify correct return values and behavior
+
+**B. Alternative Path Tests:**
+- Test each conditional branch (false path)
+- Test different switch case values
+- Test ternary operator conditions
+
+**C. Error/Exception Tests:**
+- Test each identified exception scenario
+- Test with null/invalid inputs (use `assertThrows`)
+- Test external service failures
+- Test validation failures
+
+**D. Edge Case Tests:**
+- Test with empty collections/strings
+- Test boundary conditions
+- Test concurrent scenarios if applicable
+
+#### 3. ADVANCED MOCKING PATTERNS
+**Static Method Mocking (when needed):**
+```java
+try (MockedStatic<ClassName> mockedStatic = mockStatic(ClassName.class)) {{
+    mockedStatic.when(ClassName::staticMethod).thenReturn(value);
+    // test code
+}}
+```
+
+**Async/CompletableFuture Mocking:**
+```java
+CompletableFuture<Type> future = CompletableFuture.completedFuture(mockData);
+when(asyncService.methodAsync(any())).thenReturn(future);
+```
+
+**Complex Exception Scenarios:**
+```java
+when(service.method(any())).thenThrow(new SpecificException("Detailed message"));
+```
+
+#### 4. MOCKING BEST PRACTICES
+- **NEVER access private fields directly** (e.g., don't use `service.privateField`)
+- Use `@Mock` annotations for dependencies, not direct field access
+- Only mock methods that are actually used in the test
+- Use `when().thenReturn()` for method stubbing
+- Use `verify()` to verify mock interactions when needed
+- Create realistic test data that matches production scenarios
+
+#### 5. TEST NAMING AND ORGANIZATION
+- Name tests as `testMethodName_Scenario_ExpectedResult` (e.g., `testGetSecuredLoans_ValidRequest_ReturnsSuccess`)
+- Use `@DisplayName` for complex scenarios
+- Group related assertions together
+- Use descriptive test names that explain the scenario being tested
+
+#### 6. ASSERTION PATTERNS
+**Comprehensive Assertions:**
+```java
+// Verify return values
+assertNotNull(result, "Result should not be null");
+assertEquals(expectedValue, result.getValue(), "Value should match expected");
+
+// Verify collections
+assertEquals(expectedSize, result.getList().size(), "List size should match");
+assertTrue(result.getList().contains(expectedItem), "List should contain expected item");
+
+// Verify object state
+assertEquals(expectedStatus, entity.getStatus(), "Status should be updated");
+```
+
+#### 7. VERIFICATION PATTERNS
+**Method Call Verification:**
+```java
+verify(mockService).method(eq(expectedParam));
+verify(mockService, times(2)).method(any());
+verify(mockService, never()).method(any());
+```
+
+**Argument Capture (when needed):**
+```java
+ArgumentCaptor<Type> captor = ArgumentCaptor.forClass(Type.class);
+verify(mockService).method(captor.capture());
+assertEquals(expectedValue, captor.getValue().getField());
+```
+
+#### 8. TEST STRUCTURE TEMPLATE
+```java
+@Test
+@DisplayName("Should handle scenario when condition occurs")
+void testMethodName_Scenario_ExpectedResult() {{
+    // Arrange
+    InputType input = createValidInput();
+    when(dependency.method(any())).thenReturn(expectedResult);
+    
+    // Act
+    ResultType result = serviceUnderTest.methodName(input);
+    
+    // Assert
+    assertNotNull(result);
+    assertEquals(expectedValue, result.getValue());
+    verify(dependency).method(eq(input));
+}}
+```
+
+#### 9. QUALITY REQUIREMENTS
+- Keep tests focused and simple
+- Avoid unnecessary setup or teardown
+- Don't create stubs for methods that aren't used
+- Use meaningful test data that reflects real usage
+- When DTOs are available, create realistic test data that matches their structure
+- Test both synchronous and asynchronous scenarios
+- Include transaction rollback testing for `@Transactional` methods
+
+#### 10. COVERAGE GOALS
+- Test every execution path identified in the flow analysis
+- Test all exception scenarios found in the analysis
+- Test edge cases and boundary conditions
+- Verify all mock interactions identified in dependency analysis
+- Test async operations and timeouts
+
+Generate comprehensive, production-quality test methods now, following these strict guidelines and using the flow analysis data.
 """
 
-    def _create_finalization_prompt(self, java_code, class_name, package_name, combined_snippets):
+    def _create_finalization_prompt(self, java_code, class_name, package_name, combined_snippets, additional_context=None):
         """Creates a prompt to combine and finalize the generated test snippets."""
         dependencies = self._extract_dependencies(java_code)
         dep_list = ", ".join([f"`{d['type']} {d['name']}`" for d in dependencies]) or "None"
+
+        # Enhanced context section
+        context_section = ""
+        if additional_context:
+            # Process DTOs and related Java files
+            dto_files = {k: v for k, v in additional_context.items() if k.endswith('.java')}
+            if dto_files:
+                context_section += "\n### Available DTOs and Related Classes\n"
+                for dto_name, dto_code in dto_files.items():
+                    context_section += f"#### {dto_name}\n```java\n{dto_code}\n```\n\n"
+            
+            # Add package information if available
+            if 'package_name' in additional_context:
+                context_section += f"\n### Package Information\n```\nPackage: {additional_context['package_name']}\n```\n\n"
+            
+            # Add imports if available
+            if 'imports' in additional_context:
+                context_section += f"\n### Relevant Imports\n```java\n{additional_context['imports']}\n```\n\n"
+            
+            # Add any other context items
+            other_context = {k: v for k, v in additional_context.items() 
+                           if not k.endswith('.java') and k not in ['package_name', 'imports']}
+            if other_context:
+                context_section += "\n### Additional Context\n"
+                for key, value in other_context.items():
+                    context_section += f"#### {key}\n```\n{value}\n```\n\n"
 
         return f"""You are a senior Java test automation engineer. Your task is to assemble a complete and valid JUnit 5 test class from a set of generated test method snippets.
 
@@ -286,6 +530,8 @@ package {package_name};
 {java_code}
 ```
 
+{context_section}
+
 ### Detected Dependencies to Mock
 {dep_list}
 
@@ -295,19 +541,36 @@ Here are the generated test methods. They may be incomplete, contain errors, or 
 {combined_snippets}
 ```
 
-### FINAL INSTRUCTIONS
-1.  **Assemble a Single, Complete Class:** Create one full, runnable JUnit 5 test class named `{class_name}Test`.
-2.  **Package and Imports:** Start with the correct package (`package {package_name};`) and add ALL necessary imports (JUnit, Mockito, etc.).
-3.  **Class and Mock Setup:**
-    - Annotate the class with `@ExtendWith(MockitoExtension.class)`.
-    - Create `@Mock` fields for all dependencies.
-    - Create the `@InjectMocks` field for the class under test.
-    - Add a `@BeforeEach` `setUp()` method with `MockitoAnnotations.openMocks(this);`.
-4.  **Integrate and Clean:**
-    - Place all the provided test method snippets inside the class.
-    - **Fix all syntax errors and consolidate duplicate imports.**
-    - Ensure consistent formatting and that the code is complete.
-5.  **No Placeholders:** The final output MUST be a complete, runnable file. Do not include `// TODO` or comments about missing code.
+### STRICT INSTRUCTIONS
+1. **Class Structure**:
+   - Create a complete JUnit 5 test class named `{class_name}Test`.
+   - Start with the correct package declaration: `package {package_name};`
+   - Add ALL necessary imports (JUnit, Mockito, etc.).
+
+2. **Mock Setup**:
+   - Annotate the class with `@ExtendWith(MockitoExtension.class)`.
+   - Create `@Mock` fields for ALL dependencies.
+   - Create the `@InjectMocks` field for the class under test.
+   - Add a `@BeforeEach` `setUp()` method with `MockitoAnnotations.openMocks(this);`.
+
+3. **Test Method Integration**:
+   - Place all provided test method snippets inside the class.
+   - Fix any syntax errors and consolidate duplicate imports.
+   - Ensure consistent formatting and that the code is complete.
+
+4. **Mocking Best Practices**:
+   - NEVER access private fields directly.
+   - Use `@Mock` annotations for all dependencies.
+   - Only mock methods that are actually used in tests.
+   - Use `when().thenReturn()` for method stubbing.
+   - Use `verify()` only when necessary.
+
+5. **Code Quality**:
+   - Remove any unnecessary stubs or verifications.
+   - Keep tests focused and simple.
+   - Use meaningful test data.
+   - Follow the Arrange-Act-Assert pattern.
+   - When DTOs are available, create realistic test data that matches their structure.
 
 Generate the final, complete, and correct JUnit 5 test class now.
 """
@@ -361,7 +624,7 @@ class {class_name}Test {{
 """
         return code
 
-    def _generate_tests_chunked(self, java_code, class_name, package_name, model_type, methods):
+    def _generate_tests_chunked(self, java_code, class_name, package_name, model_type, methods, additional_context=None):
         """Generates tests by breaking the class into method chunks and then combining the results."""
         # Chunk methods into groups of 4 to manage prompt size
         method_chunks = [methods[i:i + 4] for i in range(0, len(methods), 4)]
@@ -370,7 +633,7 @@ class {class_name}Test {{
         generated_test_snippets = []
         for i, chunk in enumerate(method_chunks):
             logger.info(f"Generating tests for chunk {i+1}/{len(method_chunks)}...")
-            chunk_prompt = self._create_chunk_generation_prompt(java_code, class_name, package_name, chunk)
+            chunk_prompt = self._create_chunk_generation_prompt(java_code, class_name, package_name, chunk, additional_context)
             try:
                 response = self.generate_with_deepseek_v2(chunk_prompt, max_tokens=2048)
                 snippet = response['choices'][0]['text']
@@ -386,7 +649,7 @@ class {class_name}Test {{
         logger.info("Combining and finalizing all generated test snippets.")
         combined_snippets = "\n\n".join(generated_test_snippets)
         
-        finalization_prompt = self._create_finalization_prompt(java_code, class_name, package_name, combined_snippets)
+        finalization_prompt = self._create_finalization_prompt(java_code, class_name, package_name, combined_snippets, additional_context)
         
         try:
             final_response = self.generate_with_deepseek_v2(finalization_prompt, max_tokens=8192)
@@ -396,7 +659,7 @@ class {class_name}Test {{
             logger.error(f"Final test formatting failed for {class_name}: {e}")
             return self._stitch_snippets_manually(java_code, class_name, package_name, combined_snippets)
 
-    def generate_junit_tests(self, java_code, class_name=None, model_type="auto"):
+    def generate_junit_tests(self, java_code, class_name=None, model_type="auto", additional_context=None):
         """
         Main method to generate JUnit tests for a given Java class.
         It orchestrates the process of parsing, chunking, and generating tests.
@@ -411,16 +674,80 @@ class {class_name}Test {{
         line_count = len(java_code.split('\n'))
         methods = self._extract_methods_with_details(java_code)
         
+        # Analyze class characteristics for better test generation
+        characteristics = self._analyze_class_characteristics(java_code)
+        
+        # Perform detailed code flow analysis
+        logger.info(f"Performing detailed code flow analysis for {class_name}...")
+        flow_analysis = self._analyze_code_flow(java_code, class_name)
+        
+        # Log additional context if provided
+        if additional_context:
+            logger.info(f"Enhanced generation for {class_name} with {len(additional_context)} context items")
+        
+        logger.info(f"Class analysis for {class_name}: {characteristics['class_type']}, "
+                   f"Transactions: {characteristics['has_transactions']}, "
+                   f"Async: {characteristics['has_async_operations']}, "
+                   f"External Services: {characteristics['has_external_services']}")
+        
+        # Log flow analysis summary
+        total_methods_analyzed = len(flow_analysis['method_flows'])
+        total_branches = sum(len(branches.get('if_statements', [])) for branches in flow_analysis['conditional_branches'].values())
+        total_exceptions = sum(len(exceptions.get('thrown_exceptions', [])) for exceptions in flow_analysis['exception_paths'].values())
+        
+        logger.info(f"Flow analysis completed: {total_methods_analyzed} methods, "
+                   f"{total_branches} conditional branches, {total_exceptions} exception paths")
+        
+        # Add characteristics and flow analysis to additional context
+        if additional_context is None:
+            additional_context = {}
+        additional_context['class_characteristics'] = characteristics
+        additional_context['flow_analysis'] = flow_analysis
+        
+        # For complex classes with detailed flow analysis, use the chunked approach
+        # This ensures better handling of complex code with multiple methods and branches
+        if total_methods_analyzed > 0 and (total_branches > 5 or total_exceptions > 2 or characteristics['has_async_operations']):
+            logger.info(f"Class '{class_name}' has complex flow patterns. Using chunked generation with detailed analysis.")
+            # Add flow analysis to context for chunked generation
+            methods = self._extract_methods_with_details(java_code)
+            return self._generate_tests_chunked(java_code, class_name, package_name, model_type, methods, additional_context)
+        
         # Heuristic: if the class is small (under 150 lines and < 5 methods), use single-shot.
         # Otherwise, use the more robust chunking approach.
         if line_count < 150 and len(methods) < 5:
             logger.info(f"Class '{class_name}' is small ({line_count} lines, {len(methods)} methods). Using single-shot generation.")
-            return self._generate_tests_single_shot(java_code, class_name, package_name, model_type)
+            return self._generate_tests_single_shot(java_code, class_name, package_name, model_type, additional_context)
         
         logger.info(f"Class '{class_name}' is large ({line_count} lines, {len(methods)} methods). Using chunked generation.")
-        return self._generate_tests_chunked(java_code, class_name, package_name, model_type, methods)
+        return self._generate_tests_chunked(java_code, class_name, package_name, model_type, methods, additional_context)
 
-    def _generate_tests_single_shot(self, java_code, class_name, package_name, model_type):
+    def _generate_tests_with_flow_analysis(self, java_code, class_name, package_name, model_type, flow_analysis, additional_context=None):
+        """
+        Generates tests using detailed code flow analysis for maximum accuracy.
+        """
+        try:
+            logger.info(f"Generating tests with detailed flow analysis for {class_name}")
+            
+            # Create the enhanced prompt with flow analysis
+            prompt = self._create_detailed_flow_analysis_prompt(java_code, class_name, package_name, flow_analysis, additional_context)
+            
+            # Use the V2 model with maximum tokens for comprehensive analysis
+            if model_type == '6b' and self.deepseek_6b_initialized:
+                raise NotImplementedError("Local 6.7B model generation is not fully implemented here.")
+            else:
+                response = self.generate_with_deepseek_v2(prompt, max_tokens=16384)  # Maximum tokens for detailed analysis
+                generated_text = response['choices'][0]['text']
+
+            # Clean the generated code to ensure it's a valid Java file
+            return self._clean_generated_code(generated_text, class_name)
+                
+        except Exception as e:
+            logger.error(f"Flow analysis test generation failed for {class_name}: {e}")
+            # Fallback to regular single-shot generation
+            logger.info(f"Falling back to regular single-shot generation for {class_name}")
+            return self._generate_tests_single_shot(java_code, class_name, package_name, model_type, additional_context)
+
+    def _generate_tests_single_shot(self, java_code, class_name, package_name, model_type, additional_context=None):
         """
         Generates a complete test class in a single request to the AI model.
         This method constructs a highly detailed and strict prompt to ensure
@@ -429,6 +756,32 @@ class {class_name}Test {{
         dependencies = self._extract_dependencies(java_code)
         methods_to_test = self._extract_methods(java_code)
         method_list_str = "\n- ".join(methods_to_test) if methods_to_test else "No public methods found."
+
+        # Build additional context section for the prompt
+        context_section = ""
+        enhanced_guidance = ""
+        
+        if additional_context:
+            # Process DTOs and related Java files
+            dto_files = {k: v for k, v in additional_context.items() if k.endswith('.java')}
+            if dto_files:
+                context_section += "\n### Available DTOs and Related Classes\n"
+                for dto_name, dto_code in dto_files.items():
+                    context_section += f"#### {dto_name}\n```java\n{dto_code}\n```\n\n"
+            
+            # Add package information if available
+            if 'package_name' in additional_context:
+                context_section += f"\n### Package Information\n```\nPackage: {additional_context['package_name']}\n```\n\n"
+            
+            # Add imports if available
+            if 'imports' in additional_context:
+                context_section += f"\n### Relevant Imports\n```java\n{additional_context['imports']}\n```\n\n"
+            
+            # Add class-specific guidance
+            if 'class_characteristics' in additional_context:
+                characteristics = additional_context['class_characteristics']
+                enhanced_guidance = self._get_enhanced_test_guidance(characteristics)
+                context_section += f"\n### Class-Specific Test Guidance\n{enhanced_guidance}\n\n"
 
         prompt = f"""You are a senior Java test automation engineer. Your mission is to write a production-ready, comprehensive, and complete JUnit 5 test class for the provided Java code.
 
@@ -439,41 +792,179 @@ package {package_name};
 {java_code}
 ```
 
+{context_section}
+
 ### Class to be Tested: `{class_name}`
 
 ### Public Methods to Test:
 You are required to generate tests for the following public methods:
 - {method_list_str}
 
-### STRICT INSTRUCTIONS:
-1.  **FULL COVERAGE IS MANDATORY:** You MUST write test cases for EVERY single public method listed above. No exceptions.
-2.  **NO INCOMPLETE CODE:** You MUST NOT generate partial code, placeholder comments (`// TODO`, `// ...`), or any comments suggesting that more tests are needed. The generated test class must be complete and final.
-3.  **COMPLETE & RUNNABLE FILE:** The output must be a single, complete, and runnable Java file. It must start with the package declaration (`package {package_name};`) and include all necessary imports for JUnit 5, Mockito, and the classes under test.
-4.  **MOCKING:**
-    - The test class MUST be annotated with `@ExtendWith(MockitoExtension.class)`.
-    - Use `@Mock` for all dependencies. Detected dependencies are: {', '.join([d['type'].split('.')[-1] + ' ' + d['name'] for d in dependencies]) or 'None'}.
-    - Use `@InjectMocks` for the class under test: `private {class_name} {class_name[0].lower() + class_name[1:]};`.
-5.  **TEST METHOD REQUIREMENTS:**
-    - **Naming:** Follow the `test<MethodName>_<Scenario>` convention (e.g., `testHealth_Success`, `testInitializeModel_Failure`).
-    - **Scenarios:** For each method, provide:
-        - At least one **positive test** (happy path).
-        - **Negative tests** for failure modes (e.g., invalid inputs, exceptions). Use `assertThrows`.
-        - **Edge case tests** where applicable (e.g., null inputs, empty lists).
-    - **Structure:** Strictly follow the **Arrange-Act-Assert** pattern, marked with comments (`// Arrange`, `// Act`, `// Assert`).
-    - **Verification:** Verify mock interactions using `verify()` (e.g., `verify(myMock, times(1)).someMethod(any());`).
+### COMPREHENSIVE TEST GENERATION INSTRUCTIONS:
 
-### Final Command
-Generate the complete and final JUnit 5 test class for `{class_name}` now.
+#### 1. CLASS STRUCTURE & SETUP
+- **Package & Imports**: Start with correct package declaration and ALL necessary imports
+- **Annotations**: Use `@ExtendWith(MockitoExtension.class)` for the test class
+- **Mock Setup**: Create `@Mock` fields for ALL dependencies: {', '.join([d['type'].split('.')[-1] + ' ' + d['name'] for d in dependencies]) or 'None'}
+- **Class Under Test**: Use `@InjectMocks private {class_name} {class_name[0].lower() + class_name[1:]};`
+- **Setup Method**: Include `@BeforeEach void setUp()` with `MockitoAnnotations.openMocks(this);`
+
+#### 2. TEST METHOD REQUIREMENTS
+**For EACH public method, generate multiple test scenarios:**
+
+**A. Success/Happy Path Tests:**
+- Test normal execution with valid inputs
+- Test with typical data scenarios
+- Verify correct return values and state changes
+
+**B. Error/Exception Tests:**
+- Test with null inputs (use `assertThrows`)
+- Test with invalid data
+- Test business logic exceptions
+- Test external service failures
+
+**C. Edge Case Tests:**
+- Test with empty collections/strings
+- Test boundary conditions
+- Test concurrent scenarios if applicable
+
+**D. Integration Scenarios:**
+- Test method interactions with dependencies
+- Test transaction rollback scenarios
+- Test async operations if present
+
+#### 3. ADVANCED MOCKING PATTERNS
+**Static Method Mocking:**
+```java
+try (MockedStatic<ClassName> mockedStatic = mockStatic(ClassName.class)) {{
+    mockedStatic.when(ClassName::staticMethod).thenReturn(value);
+    // test code
+}}
+```
+
+**Complex Object Mocking:**
+- Create realistic test data that matches actual usage
+- Use builder patterns when available
+- Mock nested objects properly
+
+**Async/CompletableFuture Mocking:**
+```java
+CompletableFuture<Type> future = CompletableFuture.completedFuture(mockData);
+when(asyncService.methodAsync(any())).thenReturn(future);
+```
+
+**Exception Scenarios:**
+```java
+when(service.method(any())).thenThrow(new SpecificException("message"));
+```
+
+#### 4. VERIFICATION PATTERNS
+**Method Call Verification:**
+```java
+verify(mockService).method(eq(expectedParam));
+verify(mockService, times(2)).method(any());
+verify(mockService, never()).method(any());
+```
+
+**Argument Capture:**
+```java
+ArgumentCaptor<Type> captor = ArgumentCaptor.forClass(Type.class);
+verify(mockService).method(captor.capture());
+assertEquals(expectedValue, captor.getValue().getField());
+```
+
+#### 5. TEST DATA CREATION
+**Helper Methods:**
+- Create private helper methods for test data creation
+- Use realistic data that matches production scenarios
+- Create both valid and invalid test data sets
+
+**Example:**
+```java
+private EntityType createValidEntity() {{
+    return EntityType.builder()
+        .field1("validValue")
+        .field2(123L)
+        .build();
+}}
+```
+
+#### 6. ASSERTION BEST PRACTICES
+**Comprehensive Assertions:**
+- Verify return values with specific assertions
+- Check object state changes
+- Verify collection contents and sizes
+- Use custom assertion messages
+
+**Examples:**
+```java
+assertEquals(expectedValue, actualValue, "Custom error message");
+assertNotNull(result, "Result should not be null");
+assertTrue(condition, "Condition should be true");
+assertThat(list).hasSize(3).contains(expectedItem);
+```
+
+#### 7. TEST ORGANIZATION
+**Naming Convention:**
+- Use descriptive test names: `testMethodName_Scenario_ExpectedResult`
+- Group related tests together
+- Use `@DisplayName` for complex scenarios
+
+**Test Structure:**
+```java
+@Test
+@DisplayName("Should return success when valid data is provided")
+void testMethodName_ValidData_ReturnsSuccess() {{
+    // Arrange
+    Type input = createValidInput();
+    when(dependency.method(any())).thenReturn(expectedResult);
+    
+    // Act
+    ResultType result = serviceUnderTest.methodName(input);
+    
+    // Assert
+    assertNotNull(result);
+    assertEquals(expectedValue, result.getValue());
+    verify(dependency).method(eq(input));
+}}
+```
+
+#### 8. COVERAGE REQUIREMENTS
+**Ensure 100% method coverage:**
+- Test every public method
+- Test every branch/condition
+- Test exception handling paths
+- Test async/callback scenarios
+
+**Transaction Testing:**
+- Test `@Transactional` methods with rollback scenarios
+- Verify database state changes
+- Test concurrent access patterns
+
+#### 9. PERFORMANCE & RESOURCE TESTING
+- Test timeout scenarios
+- Test with large data sets
+- Verify resource cleanup
+- Test memory usage patterns
+
+### FINAL REQUIREMENTS:
+1. **Complete Runnable Code**: Generate a full, compilable test class
+2. **No Placeholders**: No TODO comments or incomplete methods
+3. **Realistic Test Data**: Use meaningful test data that reflects real usage
+4. **Comprehensive Coverage**: Test all scenarios, not just happy paths
+5. **Production Quality**: Code should be maintainable and follow best practices
+
+Generate the complete, comprehensive JUnit 5 test class now.
 """
         
         try:
-            logger.info(f"Generating single-shot tests for {class_name} with a strict prompt.")
+            logger.info(f"Generating comprehensive single-shot tests for {class_name} with enhanced prompting.")
             # The model type selection is handled here for future extension,
             # but currently, it always defaults to the V2 model if available.
             if model_type == '6b' and self.deepseek_6b_initialized:
                  raise NotImplementedError("Local 6.7B model generation is not fully implemented here.")
             else:
-                 response = self.generate_with_deepseek_v2(prompt, max_tokens=8192) # Increased max_tokens
+                 response = self.generate_with_deepseek_v2(prompt, max_tokens=12288) # Increased max_tokens for comprehensive tests
                  generated_text = response['choices'][0]['text']
 
             # Clean the generated code to ensure it's a valid Java file
@@ -516,7 +1007,7 @@ Generate the complete and final JUnit 5 test class for `{class_name}` now.
             logger.warning(f"Could not find package declaration in generated code for {class_name}.")
             # We can still try to return the text and hope it's usable
             return f"// AI Generation Error: Could not find package declaration.\n{cleaned_text}"
-
+            
         return cleaned_text
 
     def check_ollama_running(self):
@@ -632,8 +1123,735 @@ class {class_name}Test {{
     void generationFailed() {{
         fail("AI test generation failed. Please see the comments in this file and check the application logs for more details.");
     }}
-}}
+    }}
 """
+        
+    def _analyze_class_characteristics(self, java_code):
+        """Analyzes the Java class to identify patterns that should influence test generation."""
+        characteristics = {
+            'has_transactions': False,
+            'has_async_operations': False,
+            'has_static_methods': False,
+            'has_builders': False,
+            'has_validation': False,
+            'has_external_services': False,
+            'has_database_operations': False,
+            'class_type': self._get_class_type(java_code),
+            'exception_types': [],
+            'async_patterns': [],
+            'validation_patterns': []
+        }
+        
+        # Check for transactional methods
+        if re.search(r'@Transactional', java_code):
+            characteristics['has_transactions'] = True
+        
+        # Check for async operations
+        async_patterns = [
+            r'CompletableFuture',
+            r'@Async',
+            r'async\w*Service',
+            r'\.runAsync\(',
+            r'\.supplyAsync\(',
+            r'applicationTaskExecutor'
+        ]
+        for pattern in async_patterns:
+            if re.search(pattern, java_code):
+                characteristics['has_async_operations'] = True
+                characteristics['async_patterns'].append(pattern)
+        
+        # Check for static method calls
+        if re.search(r'\w+\.\w+\(', java_code):
+            characteristics['has_static_methods'] = True
+        
+        # Check for builder patterns
+        if re.search(r'\.builder\(\)', java_code):
+            characteristics['has_builders'] = True
+        
+        # Check for validation annotations
+        validation_patterns = [
+            r'@Valid',
+            r'@NotNull',
+            r'@NotEmpty',
+            r'@Size',
+            r'@Min',
+            r'@Max',
+            r'throw new.*Exception'
+        ]
+        for pattern in validation_patterns:
+            if re.search(pattern, java_code):
+                characteristics['has_validation'] = True
+                characteristics['validation_patterns'].append(pattern)
+        
+        # Check for external service calls
+        external_service_patterns = [
+            r'restTemplate\.',
+            r'webClient\.',
+            r'httpClient\.',
+            r'Service\w*\.get',
+            r'Service\w*\.post',
+            r'Service\w*\.call'
+        ]
+        for pattern in external_service_patterns:
+            if re.search(pattern, java_code):
+                characteristics['has_external_services'] = True
+        
+        # Check for database operations
+        db_patterns = [
+            r'Repository\w*\.',
+            r'\.save\(',
+            r'\.findBy',
+            r'\.delete',
+            r'@Query',
+            r'EntityManager'
+        ]
+        for pattern in db_patterns:
+            if re.search(pattern, java_code):
+                characteristics['has_database_operations'] = True
+        
+        # Extract exception types
+        exception_matches = re.findall(r'throw new (\w+Exception)', java_code)
+        characteristics['exception_types'] = list(set(exception_matches))
+        
+        return characteristics
+
+    def _get_enhanced_test_guidance(self, characteristics):
+        """Generates specific test guidance based on class characteristics."""
+        guidance = []
+        
+        if characteristics['has_transactions']:
+            guidance.append("""
+**Transaction Testing:**
+- Test rollback scenarios with `@Transactional(rollbackFor = Exception.class)`
+- Verify database state changes
+- Test concurrent transaction scenarios
+- Mock transaction manager if needed""")
+        
+        if characteristics['has_async_operations']:
+            guidance.append("""
+**Async Operation Testing:**
+- Mock CompletableFuture operations: `CompletableFuture.completedFuture(mockData)`
+- Test timeout scenarios: `CompletableFuture.failedFuture(new TimeoutException())`
+- Verify async execution with `verify(executor).execute(any(Runnable.class))`
+- Test exception handling in async operations""")
+        
+        if characteristics['has_external_services']:
+            guidance.append("""
+**External Service Testing:**
+- Mock HTTP responses with different status codes
+- Test connection timeouts and failures
+- Test retry mechanisms
+- Verify request parameters and headers""")
+        
+        if characteristics['has_database_operations']:
+            guidance.append("""
+**Database Operation Testing:**
+- Mock repository methods with realistic return values
+- Test entity not found scenarios
+- Test constraint violations
+- Verify save/update operations with argument captors""")
+        
+        if characteristics['has_validation']:
+            guidance.append("""
+**Validation Testing:**
+- Test all validation failure scenarios
+- Use `assertThrows` for validation exceptions
+- Test edge cases for size/range validations
+- Verify error messages are meaningful""")
+        
+        if characteristics['exception_types']:
+            exception_list = ', '.join(characteristics['exception_types'])
+            guidance.append(f"""
+**Exception Scenario Testing:**
+- Test all custom exceptions: {exception_list}
+- Verify exception messages and error codes
+- Test exception propagation
+- Test error handling and recovery""")
+        
+        return '\n'.join(guidance)
+
+    def _analyze_code_flow(self, java_code, class_name):
+        """Performs detailed code flow analysis to understand method execution paths."""
+        flow_analysis = {
+            'method_flows': {},
+            'conditional_branches': {},
+            'exception_paths': {},
+            'dependency_interactions': {},
+            'data_transformations': {},
+            'validation_points': {},
+            'async_operations': {},
+            'transaction_boundaries': {}
+        }
+        
+        # Extract all methods with their bodies
+        method_pattern = re.compile(
+            r'(public|private|protected)\s+(?:static\s+)?(?:final\s+)?([\w<>,.?\s\[\]]+)\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*(?:throws\s+[\w,.\s]+)?\s*\{',
+            re.MULTILINE
+        )
+        
+        methods = method_pattern.finditer(java_code)
+        
+        for method_match in methods:
+            visibility = method_match.group(1)
+            return_type = method_match.group(2).strip()
+            method_name = method_match.group(3)
+            parameters = method_match.group(4).strip()
+            
+            # Skip if not public method
+            if visibility != 'public':
+                continue
+                
+            # Find method body
+            method_start = method_match.end()
+            method_body = self._extract_method_body(java_code, method_start)
+            
+            if method_body:
+                flow_analysis['method_flows'][method_name] = self._analyze_method_flow(method_body, method_name)
+                flow_analysis['conditional_branches'][method_name] = self._find_conditional_branches(method_body)
+                flow_analysis['exception_paths'][method_name] = self._find_exception_paths(method_body)
+                flow_analysis['dependency_interactions'][method_name] = self._find_dependency_calls(method_body)
+                flow_analysis['data_transformations'][method_name] = self._find_data_transformations(method_body)
+                flow_analysis['validation_points'][method_name] = self._find_validation_points(method_body)
+                flow_analysis['async_operations'][method_name] = self._find_async_operations(method_body)
+                flow_analysis['transaction_boundaries'][method_name] = self._find_transaction_boundaries(method_body)
+        
+        return flow_analysis
+    
+    def _extract_method_body(self, java_code, start_pos):
+        """Extracts the complete method body by matching braces."""
+        brace_count = 0
+        in_string = False
+        escape_next = False
+        i = start_pos
+        
+        # Find the opening brace
+        while i < len(java_code) and java_code[i] != '{':
+            i += 1
+        
+        if i >= len(java_code):
+            return None
+            
+        method_start = i
+        brace_count = 1
+        i += 1
+        
+        while i < len(java_code) and brace_count > 0:
+            char = java_code[i]
+            
+            if escape_next:
+                escape_next = False
+            elif char == '\\':
+                escape_next = True
+            elif char == '"' and not escape_next:
+                in_string = not in_string
+            elif not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+            
+            i += 1
+        
+        if brace_count == 0:
+            return java_code[method_start:i]
+        
+        return None
+    
+    def _analyze_method_flow(self, method_body, method_name):
+        """Analyzes the execution flow within a method."""
+        flow_info = {
+            'entry_points': 1,
+            'exit_points': [],
+            'loops': [],
+            'recursive_calls': [],
+            'early_returns': [],
+            'complexity_score': 1
+        }
+        
+        # Find return statements
+        return_pattern = re.compile(r'\breturn\b(?:\s+[^;]+)?;')
+        returns = return_pattern.findall(method_body)
+        flow_info['exit_points'] = returns
+        flow_info['early_returns'] = [r for r in returns if 'return' in r and not r.strip().endswith('return;')]
+        
+        # Find loops
+        loop_patterns = [
+            r'\bfor\s*\([^)]*\)',
+            r'\bwhile\s*\([^)]*\)',
+            r'\bdo\s*\{.*?\}\s*while\s*\([^)]*\)'
+        ]
+        for pattern in loop_patterns:
+            loops = re.findall(pattern, method_body, re.DOTALL)
+            flow_info['loops'].extend(loops)
+        
+        # Find recursive calls
+        if method_name in method_body:
+            recursive_calls = re.findall(rf'\b{method_name}\s*\(', method_body)
+            flow_info['recursive_calls'] = recursive_calls
+        
+        # Calculate cyclomatic complexity
+        decision_points = len(re.findall(r'\b(if|else|while|for|case|catch|&&|\|\|)\b', method_body))
+        flow_info['complexity_score'] = decision_points + 1
+        
+        return flow_info
+    
+    def _find_conditional_branches(self, method_body):
+        """Finds all conditional branches and their conditions."""
+        branches = {
+            'if_statements': [],
+            'switch_cases': [],
+            'ternary_operators': [],
+            'null_checks': [],
+            'empty_checks': []
+        }
+        
+        # Find if statements with conditions
+        if_pattern = re.compile(r'if\s*\(([^)]+)\)', re.MULTILINE)
+        if_matches = if_pattern.findall(method_body)
+        branches['if_statements'] = if_matches
+        
+        # Find switch cases
+        switch_pattern = re.compile(r'switch\s*\([^)]+\).*?case\s+([^:]+):', re.DOTALL)
+        switch_matches = switch_pattern.findall(method_body)
+        branches['switch_cases'] = switch_matches
+        
+        # Find ternary operators
+        ternary_pattern = re.compile(r'([^?]+)\s*\?\s*([^:]+)\s*:\s*([^;,)]+)')
+        ternary_matches = ternary_pattern.findall(method_body)
+        branches['ternary_operators'] = ternary_matches
+        
+        # Find null checks
+        null_checks = re.findall(r'(\w+)\s*[!=]=\s*null', method_body)
+        branches['null_checks'] = null_checks
+        
+        # Find empty/blank checks
+        empty_checks = re.findall(r'(\w+)\.isEmpty\(\)|StringUtils\.isBlank\((\w+)\)|CollectionUtils\.isEmpty\((\w+)\)', method_body)
+        branches['empty_checks'] = [check for check_tuple in empty_checks for check in check_tuple if check]
+        
+        return branches
+    
+    def _find_exception_paths(self, method_body):
+        """Finds exception handling and throwing patterns."""
+        exceptions = {
+            'thrown_exceptions': [],
+            'caught_exceptions': [],
+            'finally_blocks': [],
+            'custom_exceptions': []
+        }
+        
+        # Find throw statements
+        throw_pattern = re.compile(r'throw\s+new\s+(\w+(?:Exception|Error))\s*\([^)]*\)')
+        thrown = throw_pattern.findall(method_body)
+        exceptions['thrown_exceptions'] = thrown
+        
+        # Find catch blocks
+        catch_pattern = re.compile(r'catch\s*\(\s*(\w+(?:Exception|Error))\s+\w+\s*\)')
+        caught = catch_pattern.findall(method_body)
+        exceptions['caught_exceptions'] = caught
+        
+        # Find finally blocks
+        finally_pattern = re.compile(r'finally\s*\{')
+        finally_blocks = finally_pattern.findall(method_body)
+        exceptions['finally_blocks'] = finally_blocks
+        
+        # Find custom exception types
+        custom_exception_pattern = re.compile(r'throw\s+new\s+(\w+Exception)\s*\([^)]*\)')
+        custom_exceptions = custom_exception_pattern.findall(method_body)
+        exceptions['custom_exceptions'] = list(set(custom_exceptions))
+        
+        return exceptions
+    
+    def _find_dependency_calls(self, method_body):
+        """Finds calls to injected dependencies and external services."""
+        dependency_calls = {
+            'repository_calls': [],
+            'service_calls': [],
+            'external_api_calls': [],
+            'static_method_calls': [],
+            'builder_usages': []
+        }
+        
+        # Find repository method calls
+        repo_pattern = re.compile(r'(\w+Repository)\.(\w+)\s*\(')
+        repo_calls = repo_pattern.findall(method_body)
+        dependency_calls['repository_calls'] = repo_calls
+        
+        # Find service method calls
+        service_pattern = re.compile(r'(\w+Service)\.(\w+)\s*\(')
+        service_calls = service_pattern.findall(method_body)
+        dependency_calls['service_calls'] = service_calls
+        
+        # Find external API calls
+        api_pattern = re.compile(r'(restTemplate|webClient|httpClient)\.(\w+)\s*\(')
+        api_calls = api_pattern.findall(method_body)
+        dependency_calls['external_api_calls'] = api_calls
+        
+        # Find static method calls
+        static_pattern = re.compile(r'([A-Z]\w+)\.(\w+)\s*\(')
+        static_calls = static_pattern.findall(method_body)
+        dependency_calls['static_method_calls'] = static_calls
+        
+        # Find builder pattern usage
+        builder_pattern = re.compile(r'(\w+)\.builder\(\)')
+        builder_calls = builder_pattern.findall(method_body)
+        dependency_calls['builder_usages'] = builder_calls
+        
+        return dependency_calls
+    
+    def _find_data_transformations(self, method_body):
+        """Finds data mapping, conversion, and transformation operations."""
+        transformations = {
+            'mappers': [],
+            'stream_operations': [],
+            'conversions': [],
+            'collections_operations': []
+        }
+        
+        # Find mapper calls
+        mapper_pattern = re.compile(r'(\w+Mapper)\.(\w+)\s*\(')
+        mapper_calls = mapper_pattern.findall(method_body)
+        transformations['mappers'] = mapper_calls
+        
+        # Find stream operations
+        stream_pattern = re.compile(r'\.stream\(\)\.(\w+)\(')
+        stream_ops = stream_pattern.findall(method_body)
+        transformations['stream_operations'] = stream_ops
+        
+        # Find type conversions
+        conversion_pattern = re.compile(r'(\w+)\.valueOf\(|(\w+)\.parse\w+\(|new\s+(\w+)\(')
+        conversions = conversion_pattern.findall(method_body)
+        transformations['conversions'] = [conv for conv_tuple in conversions for conv in conv_tuple if conv]
+        
+        # Find collection operations
+        collection_pattern = re.compile(r'(\w+)\.add\(|(\w+)\.remove\(|(\w+)\.put\(|(\w+)\.get\(')
+        collection_ops = collection_pattern.findall(method_body)
+        transformations['collections_operations'] = [op for op_tuple in collection_ops for op in op_tuple if op]
+        
+        return transformations
+    
+    def _find_validation_points(self, method_body):
+        """Finds validation logic and assertion points."""
+        validations = {
+            'null_validations': [],
+            'empty_validations': [],
+            'business_validations': [],
+            'parameter_validations': []
+        }
+        
+        # Find null validations
+        null_validations = re.findall(r'if\s*\(\s*(\w+)\s*==\s*null\s*\)', method_body)
+        validations['null_validations'] = null_validations
+        
+        # Find empty validations
+        empty_validations = re.findall(r'if\s*\(\s*(\w+)\.isEmpty\(\)\s*\)', method_body)
+        validations['empty_validations'] = empty_validations
+        
+        # Find business validation patterns
+        business_validations = re.findall(r'if\s*\(\s*!?(\w+\.\w+\([^)]*\))\s*\)', method_body)
+        validations['business_validations'] = business_validations
+        
+        return validations
+    
+    def _find_async_operations(self, method_body):
+        """Finds asynchronous operations and patterns."""
+        async_ops = {
+            'completable_futures': [],
+            'async_method_calls': [],
+            'executor_usage': [],
+            'timeout_operations': []
+        }
+        
+        # Find CompletableFuture operations
+        cf_pattern = re.compile(r'CompletableFuture\.(\w+)\(')
+        cf_ops = cf_pattern.findall(method_body)
+        async_ops['completable_futures'] = cf_ops
+        
+        # Find async method calls
+        async_pattern = re.compile(r'(\w+Async)\s*\(')
+        async_calls = async_pattern.findall(method_body)
+        async_ops['async_method_calls'] = async_calls
+        
+        # Find executor usage
+        executor_pattern = re.compile(r'(\w*[Ee]xecutor)\.(\w+)\s*\(')
+        executor_calls = executor_pattern.findall(method_body)
+        async_ops['executor_usage'] = executor_calls
+        
+        return async_ops
+    
+    def _find_transaction_boundaries(self, method_body):
+        """Finds transaction-related operations."""
+        transactions = {
+            'save_operations': [],
+            'delete_operations': [],
+            'update_operations': [],
+            'rollback_points': []
+        }
+        
+        # Find save operations
+        save_pattern = re.compile(r'(\w+)\.save\s*\(')
+        save_ops = save_pattern.findall(method_body)
+        transactions['save_operations'] = save_ops
+        
+        # Find delete operations
+        delete_pattern = re.compile(r'(\w+)\.delete\s*\(')
+        delete_ops = delete_pattern.findall(method_body)
+        transactions['delete_operations'] = delete_ops
+        
+        return transactions
+
+    def _create_detailed_flow_analysis_prompt(self, java_code, class_name, package_name, flow_analysis, additional_context=None):
+        """Creates a comprehensive prompt with detailed code flow analysis."""
+        
+        # Build flow analysis summary
+        flow_summary = self._build_flow_analysis_summary(flow_analysis)
+        
+        # Enhanced context section
+        context_section = ""
+        if additional_context:
+            # Process DTOs and related Java files
+            dto_files = {k: v for k, v in additional_context.items() if k.endswith('.java')}
+            if dto_files:
+                context_section += "\n### Available DTOs and Related Classes\n"
+                for dto_name, dto_code in dto_files.items():
+                    context_section += f"#### {dto_name}\n```java\n{dto_code}\n```\n\n"
+            
+            # Add package information if available
+            if 'package_name' in additional_context:
+                context_section += f"\n### Package Information\n```\nPackage: {additional_context['package_name']}\n```\n\n"
+            
+            # Add imports if available
+            if 'imports' in additional_context:
+                context_section += f"\n### Relevant Imports\n```java\n{additional_context['imports']}\n```\n\n"
+            
+            # Add class-specific guidance
+            if 'class_characteristics' in additional_context:
+                characteristics = additional_context['class_characteristics']
+                enhanced_guidance = self._get_enhanced_test_guidance(characteristics)
+                context_section += f"\n### Class-Specific Test Guidance\n{enhanced_guidance}\n\n"
+
+        return f"""You are a senior Java test automation engineer with expertise in code flow analysis. Your mission is to write comprehensive JUnit 5 tests based on detailed analysis of the source code execution paths.
+
+### Java Class to Test
+```java
+package {package_name};
+
+{java_code}
+```
+
+{context_section}
+
+### DETAILED CODE FLOW ANALYSIS
+{flow_summary}
+
+### COMPREHENSIVE TEST GENERATION STRATEGY
+
+#### PHASE 1: CODE PATH ANALYSIS
+Based on the detailed flow analysis above, you must:
+
+1. **Identify All Execution Paths**: For each method, trace through every possible execution path
+2. **Map Decision Points**: Test each conditional branch, switch case, and ternary operator
+3. **Validate Exception Scenarios**: Test every exception path and error condition
+4. **Verify Data Transformations**: Test all mapping, conversion, and stream operations
+5. **Test Dependency Interactions**: Mock and verify every external service call
+6. **Validate Async Operations**: Test all CompletableFuture and async scenarios
+
+#### PHASE 2: TEST SCENARIO GENERATION
+For each method, generate tests for:
+
+**A. Primary Execution Paths:**
+- Happy path with valid inputs
+- Each conditional branch (true/false scenarios)
+- All switch case values
+- Loop iterations (empty, single, multiple items)
+
+**B. Exception and Error Paths:**
+- Every thrown exception type identified in analysis
+- Null pointer scenarios for each null check
+- Empty collection/string scenarios
+- Validation failure points
+- External service failure scenarios
+
+**C. Data Flow Testing:**
+- Input validation at entry points
+- Data transformation accuracy
+- Output verification at exit points
+- State changes in entities/objects
+
+**D. Integration Testing:**
+- Repository interaction patterns
+- Service call sequences
+- Transaction boundary testing
+- Async operation completion/timeout
+
+#### PHASE 3: ADVANCED TEST PATTERNS
+
+**Static Method Mocking (for identified static calls):**
+```java
+try (MockedStatic<StaticClassName> mockedStatic = mockStatic(StaticClassName.class)) {{
+    mockedStatic.when(StaticClassName::methodName).thenReturn(expectedValue);
+    // test execution
+}}
+```
+
+**Async Operation Testing (for identified async patterns):**
+```java
+// For CompletableFuture operations
+CompletableFuture<Type> future = CompletableFuture.completedFuture(mockData);
+when(asyncService.methodAsync(any())).thenReturn(future);
+
+// For timeout scenarios
+CompletableFuture<Type> timeoutFuture = new CompletableFuture<>();
+timeoutFuture.completeExceptionally(new TimeoutException("Service timeout"));
+when(asyncService.methodAsync(any())).thenReturn(timeoutFuture);
+```
+
+**Repository/Database Testing (for identified data operations):**
+```java
+// Test save operations
+ArgumentCaptor<EntityType> entityCaptor = ArgumentCaptor.forClass(EntityType.class);
+verify(repository).save(entityCaptor.capture());
+assertEquals(expectedValue, entityCaptor.getValue().getField());
+
+// Test find operations
+when(repository.findById(anyLong())).thenReturn(Optional.of(mockEntity));
+when(repository.findById(anyLong())).thenReturn(Optional.empty()); // Not found scenario
+```
+
+#### PHASE 4: COMPREHENSIVE VERIFICATION
+
+**Method Call Verification (based on dependency analysis):**
+```java
+// Verify exact method calls identified in flow analysis
+verify(dependencyService).specificMethod(eq(expectedParam));
+verify(repository, times(2)).save(any(EntityType.class));
+verify(externalService, never()).unnecessaryMethod(any());
+```
+
+**State Verification (based on data transformation analysis):**
+```java
+// Verify object state changes
+assertEquals(expectedStatus, entity.getStatus());
+assertEquals(expectedSize, resultList.size());
+assertTrue(resultList.contains(expectedItem));
+```
+
+#### PHASE 5: TEST ORGANIZATION AND STRUCTURE
+
+**Test Class Structure:**
+```java
+@ExtendWith(MockitoExtension.class)
+class {class_name}Test {{
+    
+    // Mock all identified dependencies
+    @Mock private DependencyType dependency;
+    
+    @InjectMocks
+    private {class_name} {class_name.lower()};
+    
+    @BeforeEach
+    void setUp() {{
+        MockitoAnnotations.openMocks(this);
+    }}
+    
+    // Helper methods for test data creation
+    private EntityType createValidEntity() {{
+        return EntityType.builder()
+            .field1("validValue")
+            .field2(123L)
+            .build();
+    }}
+    
+    // Test methods following the analysis
+}}
+```
+
+**Test Method Naming Convention:**
+- `testMethodName_ConditionScenario_ExpectedResult`
+- `testMethodName_ExceptionType_ThrowsException`
+- `testMethodName_EdgeCase_HandlesCorrectly`
+
+### FINAL REQUIREMENTS:
+
+1. **100% Path Coverage**: Test every execution path identified in the flow analysis
+2. **Exception Completeness**: Test every exception scenario found in the code
+3. **Dependency Verification**: Mock and verify every external interaction
+4. **Data Accuracy**: Validate all data transformations and state changes
+5. **Async Handling**: Properly test all asynchronous operations
+6. **Production Quality**: Generate maintainable, readable, and comprehensive tests
+
+Generate the complete, comprehensive JUnit 5 test class that covers all identified code paths and scenarios.
+"""
+
+    def _build_flow_analysis_summary(self, flow_analysis):
+        """Builds a comprehensive summary of the code flow analysis."""
+        summary_parts = []
+        
+        for method_name, flow_info in flow_analysis['method_flows'].items():
+            summary_parts.append(f"\n#### Method: {method_name}")
+            summary_parts.append(f"**Complexity Score**: {flow_info['complexity_score']}")
+            summary_parts.append(f"**Exit Points**: {len(flow_info['exit_points'])}")
+            
+            if flow_info['early_returns']:
+                summary_parts.append(f"**Early Returns**: {len(flow_info['early_returns'])} (test each return condition)")
+            
+            if flow_info['loops']:
+                summary_parts.append(f"**Loops Found**: {len(flow_info['loops'])} (test empty, single, multiple iterations)")
+            
+            # Conditional branches
+            if method_name in flow_analysis['conditional_branches']:
+                branches = flow_analysis['conditional_branches'][method_name]
+                if branches['if_statements']:
+                    summary_parts.append(f"**If Conditions**: {branches['if_statements']} (test true/false for each)")
+                if branches['null_checks']:
+                    summary_parts.append(f"**Null Checks**: {branches['null_checks']} (test null/non-null scenarios)")
+                if branches['empty_checks']:
+                    summary_parts.append(f"**Empty Checks**: {branches['empty_checks']} (test empty/non-empty scenarios)")
+            
+            # Exception paths
+            if method_name in flow_analysis['exception_paths']:
+                exceptions = flow_analysis['exception_paths'][method_name]
+                if exceptions['thrown_exceptions']:
+                    summary_parts.append(f"**Thrown Exceptions**: {exceptions['thrown_exceptions']} (test each exception scenario)")
+                if exceptions['caught_exceptions']:
+                    summary_parts.append(f"**Caught Exceptions**: {exceptions['caught_exceptions']} (test exception handling)")
+            
+            # Dependency interactions
+            if method_name in flow_analysis['dependency_interactions']:
+                deps = flow_analysis['dependency_interactions'][method_name]
+                if deps['repository_calls']:
+                    summary_parts.append(f"**Repository Calls**: {deps['repository_calls']} (mock and verify each)")
+                if deps['service_calls']:
+                    summary_parts.append(f"**Service Calls**: {deps['service_calls']} (mock and verify each)")
+                if deps['external_api_calls']:
+                    summary_parts.append(f"**External API Calls**: {deps['external_api_calls']} (test success/failure scenarios)")
+                if deps['static_method_calls']:
+                    summary_parts.append(f"**Static Method Calls**: {deps['static_method_calls']} (use MockedStatic)")
+            
+            # Data transformations
+            if method_name in flow_analysis['data_transformations']:
+                transforms = flow_analysis['data_transformations'][method_name]
+                if transforms['mappers']:
+                    summary_parts.append(f"**Mapper Calls**: {transforms['mappers']} (verify mapping accuracy)")
+                if transforms['stream_operations']:
+                    summary_parts.append(f"**Stream Operations**: {transforms['stream_operations']} (test with various data sets)")
+            
+            # Async operations
+            if method_name in flow_analysis['async_operations']:
+                async_ops = flow_analysis['async_operations'][method_name]
+                if async_ops['completable_futures']:
+                    summary_parts.append(f"**Async Operations**: {async_ops['completable_futures']} (test completion/timeout/exception)")
+                if async_ops['executor_usage']:
+                    summary_parts.append(f"**Executor Usage**: {async_ops['executor_usage']} (verify async execution)")
+            
+            # Transaction boundaries
+            if method_name in flow_analysis['transaction_boundaries']:
+                transactions = flow_analysis['transaction_boundaries'][method_name]
+                if transactions['save_operations']:
+                    summary_parts.append(f"**Save Operations**: {transactions['save_operations']} (verify data persistence)")
+                if transactions['delete_operations']:
+                    summary_parts.append(f"**Delete Operations**: {transactions['delete_operations']} (verify data removal)")
+        
+        return '\n'.join(summary_parts)
 
 
 # --- Flask App ---
@@ -689,7 +1907,7 @@ def initialize_model():
     data = request.json
     model_path = data.get('model_path')
     use_gpu = data.get('use_gpu', True)
-    
+        
     if not model_path:
         return jsonify({"error": "model_path is required"}), 400
         
@@ -814,6 +2032,8 @@ def generate():
     class_name = data.get('className')
     # Align with Java client which sends 'model'
     model_type = data.get('model', 'auto')
+    # NEW: Extract additional context (DTOs, imports, etc.)
+    additional_context = data.get('additional_context', {})
         
     if not java_code:
         logger.error("Validation failed: 'prompt' key with java_code string is missing.")
@@ -827,13 +2047,15 @@ def generate():
     
     try:
         logger.info(f"Generating tests for class: {class_name} with model: {model_type}")
+        if additional_context:
+            logger.info(f"Additional context provided: {list(additional_context.keys())}")
         
         # Check if Ollama is available before proceeding
         if model_type != '6b' and not generator.check_ollama_running():
             logger.warning("Ollama is not running. Attempting to generate with fallback methods.")
             # Try to generate anyway, the fallback will kick in during chunk processing
         
-        generated_tests = generator.generate_junit_tests(java_code, class_name, model_type)
+        generated_tests = generator.generate_junit_tests(java_code, class_name, model_type, additional_context)
         
         end_time = time.time()
         duration = end_time - start_time
@@ -854,6 +2076,7 @@ def generate():
                 "deepseek-v2": generator.deepseek_v2_available,
                 "deepseek-6b": generator.deepseek_6b_initialized
             },
+            "context_items_used": len(additional_context) if additional_context else 0,
             "warnings": warnings
         })
         
